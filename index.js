@@ -29,7 +29,8 @@ const {
 const config = require('./config');
 // Auth state now lives on local disk (instant key reads) with MongoDB as the backup —
 // the custom Mongo-only store timed the pairing handshake out.
-const { useDiskAuthState, hasSession, listNumbers, deleteSession, getMongo } = require('./lib/sessionStore');
+const { useDiskAuthState, hasSession, listNumbers, listNeedsRepair, deleteSession, getMongo } = require('./lib/sessionStore');
+const { proxyOptions, PROXY_URL } = require('./lib/proxyAgent');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -140,6 +141,7 @@ async function generatePairCode(number) {
         markOnlineOnConnect: true,
         syncFullHistory: false,
         browser: ['Mac OS', 'Safari', '10.15.7'],
+        ...proxyOptions(),   // no-op unless PROXY_URL is set
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -254,6 +256,13 @@ app.listen(PORT, async () => {
             console.log(`[♻️] Restoring ${numbers.length} saved session(s): ${numbers.join(', ')}`);
             numbers.slice(0, MAX_BOTS).forEach((n, i) => setTimeout(() => startWorker(n), i * 8000));
         }
+        // Rejected numbers are reported, never auto-started — that loop wiped sessions.
+        const broken = await listNeedsRepair().catch(() => []);
+        if (broken.length) {
+            console.log(`[⚠️] Needs re-pairing (not auto-started): ${broken.join(', ')}`);
+            console.log('    Open the pairing page for these numbers to link them again.');
+        }
+        if (PROXY_URL) console.log('[🌐] PROXY_URL is set — WhatsApp traffic will use the proxy.');
     } catch (err) {
         console.error('[❌] MongoDB not reachable — check MONGODB_URI:', err.message);
     }

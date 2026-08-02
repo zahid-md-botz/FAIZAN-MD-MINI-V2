@@ -1,7 +1,14 @@
 const axios = require('axios');
 const config = require('./config');
+
+// MUST run before any ./lib or ./data require: those helpers reference a bare `conn` at
+// load time, which crashed the boot with "conn is not defined" before the socket ever
+// existed. See lib/connBridge.js.
+const connBridge = require('./lib/connBridge');
+connBridge.install();
 // Disk-based auth state + MongoDB backup (see lib/sessionStore.js for why).
-const { useDiskAuthState, deleteSession } = require('./lib/sessionStore');
+const { useDiskAuthState, deleteSession, markNeedsRepair } = require('./lib/sessionStore');
+const { proxyOptions } = require('./lib/proxyAgent');
 
 // This worker process runs ONE WhatsApp number (mini bot, multi-number safe).
 // index.js spawns one worker per paired number, so every plugin's in-memory
@@ -424,6 +431,7 @@ async function connectToWA() {
         generateHighQualityLinkPreview: true,
         syncFullHistory: true,
         browser: ['Mac OS', 'Safari', '10.15.7'],
+        ...proxyOptions(),   // no-op unless PROXY_URL is set
         getMessage: async (key) => {
             // FIX: empty-message spam bug.
             // Baileys calls getMessage() when a retry receipt asks for
@@ -438,6 +446,9 @@ async function connectToWA() {
             return undefined;
         }
     });
+
+    // Publish the live socket and replay the listeners the helpers registered at boot.
+    connBridge.attach(conn);
 
     conn.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -454,12 +465,17 @@ async function connectToWA() {
             console.log(`❌ Connection closed - Status: ${statusCode}`);
             
             if (errorMsg.includes('Bad MAC') || errorMsg.includes('closed session') || statusCode === 401 || statusCode === 403) {
-                console.log('⚠️ Session corrupted! Deleting sessions folder...');
+                // Deleting here was destroying the login the user had just created:
+                // boot auto-connect -> 401 -> wipe -> "pairing never works".
+                // Flag it instead; only /delete removes a session now.
+                console.log(`⚠️ WhatsApp rejected this session (${statusCode}). NOT deleting it.`);
+                console.log('   Marked for re-pair, session kept.');
+                console.log('   If this repeats immediately after a successful pairing, WhatsApp is');
+                console.log('   refusing this host IP — set PROXY_URL (see lib/proxyAgent.js).');
                 try {
-                    await deleteSession(BOT_NUMBER);
-                    console.log('✅ MongoDB session cleared — re-pair this number from the pairing page.');
-                    process.exit(0);
-                } catch (e) { console.error('session clear failed:', e.message); }
+                    await markNeedsRepair(BOT_NUMBER, `status ${statusCode}`);
+                } catch (e) { console.error('could not flag session:', e.message); }
+                process.exit(0);
             }
             
             if (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut) {
@@ -542,7 +558,6 @@ async function connectToWA() {
     });
 
     conn.ev.on("group-participants.update", (update) => GroupEvents(conn, update));
-    global.conn = conn;   // expose to the bare-`conn` helpers in lib/ and data/
     conn.ev.on("presence.update", (update) => PresenceControl(conn, update));
     BotActivityFilter(conn);	
     
@@ -1248,7 +1263,9 @@ process.on('SIGINT', () => {
 });
 
 process.on('uncaughtException', (err) => {
+    // A bare message ("conn is not defined") gave no way to tell which file threw.
     console.error('Uncaught Exception:', err.message);
+    if (err.stack) console.error(err.stack);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
