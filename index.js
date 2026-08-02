@@ -21,6 +21,7 @@ const { fork } = require('child_process');
 const {
     default: makeWASocket,
     fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore,
     Browsers,
     DisconnectReason,
 } = require('@whiskeysockets/baileys');
@@ -92,8 +93,19 @@ function stopWorker(number) {
 //  PAIRING — generate an 8-digit code for a number
 // ════════════════════════════════════════════════════════════════
 const pairing = new Map();  // number -> { code, at }
+// One pairing socket per number. Two live sockets for the same number make WhatsApp
+// reject the login with 401, which is easy to trigger by double-tapping the button.
+const locks = new Set();
 
 async function generatePairCode(number) {
+    if (locks.has(number)) {
+        const known = pairing.get(number);
+        if (known) return { code: known.code, reused: true };
+        return { inProgress: true };
+    }
+    locks.add(number);
+    setTimeout(() => locks.delete(number), 180000);   // never wedge the number shut
+
     let { state, saveCreds, clear } = await useMongoDBAuthState(number);
 
     if (state.creds.registered) {
@@ -105,13 +117,27 @@ async function generatePairCode(number) {
     await clear().catch(() => {});
     ({ state, saveCreds, clear } = await useMongoDBAuthState(number));
 
-    const { version } = await fetchLatestBaileysVersion();
+    // Socket options copied from the working ArslanMD mini bot. Two things matter most:
+    //   - no explicit `version`: a fetched WA-web version that WhatsApp no longer accepts
+    //     for pairing-code linking is rejected with 401/405
+    //   - cacheable signal key store: without it every key read hits MongoDB and the
+    //     pairing handshake times out right when the user submits the code
+    const pairLogger = pino({ level: 'silent' });
     const sock = makeWASocket({
-        logger: pino({ level: 'silent' }),
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pairLogger),
+        },
         printQRInTerminal: false,
-        browser: Browsers.macOS('Safari'),
-        auth: state,
-        version,
+        logger: pairLogger,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 10000,
+        emitOwnEvents: false,
+        fireInitQueries: true,
+        markOnlineOnConnect: true,
+        syncFullHistory: false,
+        browser: ['Mac OS', 'Safari', '10.15.7'],
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -119,15 +145,23 @@ async function generatePairCode(number) {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'open') {
-            console.log(`[✅] ${number} paired successfully — session saved to MongoDB`);
+            console.log(`[✅] ${number} paired successfully — finishing session sync...`);
             await saveCreds();
-            setTimeout(() => {
+            // Closing 2s after 'open' cut the post-registration key sync short, so the
+            // worker's fresh connect was rejected with 401. Give WhatsApp time to finish
+            // writing keys, then hand over.
+            setTimeout(async () => {
+                try { await saveCreds(); } catch (e) {}
+                console.log(`[💾] ${number} session stored — starting bot`);
                 try { sock.ws.close(); } catch (e) {}
-                startWorker(number);   // hand over to the real bot process
-            }, 2000);
+                pairing.delete(number);
+                locks.delete(number);
+                startWorker(number);
+            }, 15000);
         }
         if (connection === 'close') {
             const code = lastDisconnect?.error?.output?.statusCode;
+            locks.delete(number);
             if (code === DisconnectReason.loggedOut || code === 401) {
                 console.log(`[⚠️] Pairing failed for ${number} (${code}) — clearing partial session`);
                 await clear().catch(() => {});
@@ -165,6 +199,9 @@ app.get('/pair', async (req, res) => {
             return res.json({ status: 'already_paired', message: 'This number is already linked — bot is running.' });
         }
         const result = await generatePairCode(number);
+        if (result.inProgress) {
+            return res.json({ status: 'pending', message: 'Pairing already in progress — wait for the code to appear.' });
+        }
         if (result.alreadyPaired) {
             startWorker(number);
             return res.json({ status: 'already_paired', message: 'Already linked — bot started.' });

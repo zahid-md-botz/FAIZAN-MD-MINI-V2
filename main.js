@@ -32,6 +32,7 @@ const {
     makeInMemoryStore,
     jidDecode,
     fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore,
     Browsers
 } = require('@whiskeysockets/baileys');
 
@@ -398,19 +399,30 @@ async function connectToWA() {
         process.exit(0);
     }
     
-    const { version } = await fetchLatestBaileysVersion();
     
     // lib/ and data/ helpers (msg.js, exif.js, antidel.js, groupevents.js,
     // converter.js) reference a bare `conn`, which resolves to the global scope —
     // without this it throws "conn is not defined" at runtime.
     let conn;
+    const waLogger = P({ level: 'silent' });
     conn = makeWASocket({
-        logger: P({ level: 'silent' }),
+        // Same option set as the working ArslanMD mini bot: no explicit `version`,
+        // cacheable signal key store, and no 60s query timeout to abort the handshake.
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, waLogger),
+        },
+        logger: waLogger,
         printQRInTerminal: false,
-        browser: Browsers.macOS("Firefox"),
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 10000,
+        emitOwnEvents: false,
+        fireInitQueries: true,
+        markOnlineOnConnect: true,
+        generateHighQualityLinkPreview: true,
         syncFullHistory: true,
-        auth: state,
-        version,
+        browser: ['Mac OS', 'Safari', '10.15.7'],
         getMessage: async (key) => {
             // FIX: empty-message spam bug.
             // Baileys calls getMessage() when a retry receipt asks for
