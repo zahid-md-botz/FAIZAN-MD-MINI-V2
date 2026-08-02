@@ -1,6 +1,7 @@
 const axios = require('axios');
 const config = require('./config');
-const { useMongoDBAuthState, deleteSession } = require('./lib/mongoAuth');
+// Disk-based auth state + MongoDB backup (see lib/sessionStore.js for why).
+const { useDiskAuthState, deleteSession } = require('./lib/sessionStore');
 
 // This worker process runs ONE WhatsApp number (mini bot, multi-number safe).
 // index.js spawns one worker per paired number, so every plugin's in-memory
@@ -389,7 +390,7 @@ async function connectToWA() {
     console.log("[🔰] FAIZAN-MD Connecting to WhatsApp ⏳️...");
     
     // MongoDB session (mini style): survives restarts, no SESSION_ID needed
-    const { state, saveCreds } = await useMongoDBAuthState(BOT_NUMBER);
+    const { state, saveCreds } = await useDiskAuthState(BOT_NUMBER);
 
     // Guard: connecting with creds that never completed pairing earns an immediate
     // 401, and the 401 branch below would then wipe the very session the user is in

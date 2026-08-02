@@ -4,7 +4,7 @@
  * What this file does (the "mini" part):
  *   1. Serves the pairing page (pair.html) — user enters their number, gets an 8-digit
  *      WhatsApp pairing code. No SESSION_ID, no QR scanning.
- *   2. Stores every login in MongoDB (lib/mongoAuth.js), so sessions survive restarts.
+ *   2. Stores every login in MongoDB (lib/sessionStore.js), so sessions survive restarts.
  *   3. Runs ONE child process per paired number (main.js = the full FAIZAN-MD bot).
  *      Process isolation is deliberate: all 162 plugins keep their own in-memory state
  *      (antilink Maps, antidelete cache, warn counters), so numbers never mix data.
@@ -27,7 +27,9 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const config = require('./config');
-const { useMongoDBAuthState, hasSession, listNumbers, deleteSession, getMongo } = require('./lib/mongoAuth');
+// Auth state now lives on local disk (instant key reads) with MongoDB as the backup —
+// the custom Mongo-only store timed the pairing handshake out.
+const { useDiskAuthState, hasSession, listNumbers, deleteSession, getMongo } = require('./lib/sessionStore');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -106,7 +108,7 @@ async function generatePairCode(number) {
     locks.add(number);
     setTimeout(() => locks.delete(number), 180000);   // never wedge the number shut
 
-    let { state, saveCreds, clear } = await useMongoDBAuthState(number);
+    let { state, saveCreds, clear } = await useDiskAuthState(number);
 
     if (state.creds.registered) {
         return { alreadyPaired: true };
@@ -115,7 +117,7 @@ async function generatePairCode(number) {
     // Leftover keys from an abandoned/failed attempt make WhatsApp reject the new
     // pairing immediately, so drop them and re-init before asking for a code.
     await clear().catch(() => {});
-    ({ state, saveCreds, clear } = await useMongoDBAuthState(number));
+    ({ state, saveCreds, clear } = await useDiskAuthState(number));
 
     // Socket options copied from the working ArslanMD mini bot. Two things matter most:
     //   - no explicit `version`: a fetched WA-web version that WhatsApp no longer accepts
