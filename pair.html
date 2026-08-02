@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FAIZAN-MD MINI — Pair Your Number</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body {
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    min-height:100vh; display:flex; align-items:center; justify-content:center;
+    background:linear-gradient(135deg,#0f0c29 0%,#302b63 50%,#24243e 100%);
+    padding:20px; color:#fff;
+  }
+  .card {
+    width:100%; max-width:420px; background:rgba(255,255,255,.07);
+    backdrop-filter:blur(14px); border:1px solid rgba(255,255,255,.12);
+    border-radius:22px; padding:32px 26px; text-align:center;
+    box-shadow:0 18px 50px rgba(0,0,0,.45);
+  }
+  .logo { font-size:40px; margin-bottom:6px; }
+  h1 { font-size:22px; font-weight:700; letter-spacing:.5px; }
+  .sub { font-size:13px; opacity:.65; margin:6px 0 26px; }
+  label { display:block; text-align:left; font-size:12px; opacity:.75; margin-bottom:7px; }
+  input {
+    width:100%; padding:15px 16px; font-size:17px; border-radius:13px;
+    border:1px solid rgba(255,255,255,.18); background:rgba(0,0,0,.28);
+    color:#fff; outline:none; letter-spacing:1px;
+  }
+  input:focus { border-color:#a855f7; box-shadow:0 0 0 3px rgba(168,85,247,.22); }
+  .hint { font-size:11px; opacity:.5; text-align:left; margin-top:7px; }
+  button {
+    width:100%; margin-top:20px; padding:15px; font-size:16px; font-weight:700;
+    border:none; border-radius:13px; cursor:pointer; color:#fff;
+    background:linear-gradient(135deg,#7c3aed,#db2777);
+    transition:transform .12s, opacity .2s;
+  }
+  button:active { transform:scale(.98); }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  .box { margin-top:24px; display:none; }
+  .box.show { display:block; }
+  .code {
+    font-size:30px; font-weight:800; letter-spacing:5px; padding:18px;
+    border-radius:14px; background:rgba(0,0,0,.32);
+    border:1px dashed rgba(168,85,247,.55); word-break:break-all;
+  }
+  .copy { font-size:12px; opacity:.7; margin-top:9px; cursor:pointer; text-decoration:underline; }
+  .steps { text-align:left; font-size:12.5px; line-height:1.85; opacity:.85; margin-top:18px;
+           background:rgba(0,0,0,.22); padding:15px 16px; border-radius:13px; }
+  .msg { margin-top:18px; font-size:13px; padding:13px; border-radius:11px; display:none; }
+  .msg.show { display:block; }
+  .msg.err { background:rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.4); }
+  .msg.ok  { background:rgba(34,197,94,.16); border:1px solid rgba(34,197,94,.4); }
+  .spin { display:inline-block; width:15px; height:15px; border:2px solid rgba(255,255,255,.3);
+          border-top-color:#fff; border-radius:50%; animation:s .8s linear infinite; vertical-align:-2px; }
+  @keyframes s { to { transform:rotate(360deg); } }
+  footer { margin-top:22px; font-size:11px; opacity:.45; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">🤖</div>
+  <h1>FAIZAN-MD MINI</h1>
+  <div class="sub">Pairing code login · MongoDB session</div>
+
+  <label for="num">WhatsApp number (with country code)</label>
+  <input id="num" type="tel" inputmode="numeric" placeholder="923266105873" autocomplete="off">
+  <div class="hint">No +, no spaces, no dashes — e.g. 923266105873</div>
+
+  <button id="btn" onclick="pair()">Get Pairing Code</button>
+
+  <div class="msg" id="msg"></div>
+
+  <div class="box" id="box">
+    <div class="code" id="code">- - - -</div>
+    <div class="copy" onclick="copyCode()">tap to copy</div>
+    <div class="steps">
+      <b>How to link:</b><br>
+      1. Open WhatsApp on your phone<br>
+      2. <b>Settings → Linked devices</b><br>
+      3. Tap <b>Link a device</b><br>
+      4. Tap <b>Link with phone number instead</b><br>
+      5. Enter the code above ⬆️
+    </div>
+  </div>
+
+  <footer>Powered by FAIZAN-MD · 162 plugins</footer>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function show(text, type) {
+  const m = $('msg');
+  m.textContent = text;
+  m.className = 'msg show ' + type;
+}
+
+function copyCode() {
+  const c = $('code').textContent.replace(/[^0-9A-Za-z-]/g, '');
+  navigator.clipboard?.writeText(c);
+  show('Code copied ✅', 'ok');
+}
+
+async function pair() {
+  const number = $('num').value.replace(/[^0-9]/g, '');
+  if (number.length < 10) { show('Enter a valid number with country code', 'err'); return; }
+
+  const btn = $('btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> Requesting code...';
+  $('box').className = 'box';
+  show('Connecting to WhatsApp — this can take 10-20 seconds...', 'ok');
+
+  try {
+    const res = await fetch('/pair?number=' + number);
+    const data = await res.json();
+
+    if (!res.ok || data.error) {
+      show(data.error || 'Failed, please try again', 'err');
+    } else if (data.status === 'already_paired') {
+      show(data.message || 'This number is already linked ✅', 'ok');
+    } else {
+      $('code').textContent = data.code;
+      $('box').className = 'box show';
+      show('Code ready — enter it in WhatsApp within 60 seconds', 'ok');
+    }
+  } catch (e) {
+    show('Server error: ' + e.message, 'err');
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Get Pairing Code';
+}
+
+$('num').addEventListener('keypress', e => { if (e.key === 'Enter') pair(); });
+</script>
+</body>
+</html>
