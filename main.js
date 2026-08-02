@@ -389,11 +389,22 @@ async function connectToWA() {
     
     // MongoDB session (mini style): survives restarts, no SESSION_ID needed
     const { state, saveCreds } = await useMongoDBAuthState(BOT_NUMBER);
-    const creds = state.creds && state.creds.registered ? state.creds : null;
+
+    // Guard: connecting with creds that never completed pairing earns an immediate
+    // 401, and the 401 branch below would then wipe the very session the user is in
+    // the middle of creating. Stop here and let the pairing page finish its job.
+    if (!state.creds || !state.creds.registered) {
+        console.log(`[⚠️] ${BOT_NUMBER} is not paired yet — open the pairing page and enter the code. Not connecting.`);
+        process.exit(0);
+    }
     
     const { version } = await fetchLatestBaileysVersion();
     
-    const conn = makeWASocket({
+    // lib/ and data/ helpers (msg.js, exif.js, antidel.js, groupevents.js,
+    // converter.js) reference a bare `conn`, which resolves to the global scope —
+    // without this it throws "conn is not defined" at runtime.
+    let conn;
+    conn = makeWASocket({
         logger: P({ level: 'silent' }),
         printQRInTerminal: false,
         browser: Browsers.macOS("Firefox"),
@@ -518,6 +529,7 @@ async function connectToWA() {
     });
 
     conn.ev.on("group-participants.update", (update) => GroupEvents(conn, update));
+    global.conn = conn;   // expose to the bare-`conn` helpers in lib/ and data/
     conn.ev.on("presence.update", (update) => PresenceControl(conn, update));
     BotActivityFilter(conn);	
     

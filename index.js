@@ -94,11 +94,16 @@ function stopWorker(number) {
 const pairing = new Map();  // number -> { code, at }
 
 async function generatePairCode(number) {
-    const { state, saveCreds, clear } = await useMongoDBAuthState(number);
+    let { state, saveCreds, clear } = await useMongoDBAuthState(number);
 
     if (state.creds.registered) {
         return { alreadyPaired: true };
     }
+
+    // Leftover keys from an abandoned/failed attempt make WhatsApp reject the new
+    // pairing immediately, so drop them and re-init before asking for a code.
+    await clear().catch(() => {});
+    ({ state, saveCreds, clear } = await useMongoDBAuthState(number));
 
     const { version } = await fetchLatestBaileysVersion();
     const sock = makeWASocket({
@@ -213,6 +218,15 @@ app.listen(PORT, async () => {
     } catch (err) {
         console.error('[❌] MongoDB not reachable — check MONGODB_URI:', err.message);
     }
+});
+
+// A crash in this process kills the live pairing socket, and the user's freshly
+// entered code then has nothing listening for it. Log and keep serving instead.
+process.on('uncaughtException', (err) => {
+    console.error('[⚠️] Uncaught exception in pairing server:', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[⚠️] Unhandled rejection in pairing server:', reason?.message || reason);
 });
 
 process.on('SIGTERM', () => {
