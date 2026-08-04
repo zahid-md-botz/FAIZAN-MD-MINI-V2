@@ -51,10 +51,19 @@
   .msg.show { display:block; }
   .msg.err { background:rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.4); }
   .msg.ok  { background:rgba(34,197,94,.16); border:1px solid rgba(34,197,94,.4); }
+  .msg.info { background:rgba(59,130,246,.16); border:1px solid rgba(59,130,246,.4); }
   .spin { display:inline-block; width:15px; height:15px; border:2px solid rgba(255,255,255,.3);
           border-top-color:#fff; border-radius:50%; animation:s .8s linear infinite; vertical-align:-2px; }
   @keyframes s { to { transform:rotate(360deg); } }
+  .timer { font-size:11px; opacity:.55; margin-top:6px; }
   footer { margin-top:22px; font-size:11px; opacity:.45; }
+  .status-row { margin-top:18px; display:flex; gap:8px; flex-wrap:wrap; justify-content:center; }
+  .status-btn {
+    font-size:11px; padding:7px 13px; border-radius:9px; border:none;
+    cursor:pointer; background:rgba(255,255,255,.1); color:rgba(255,255,255,.75);
+    transition:background .15s;
+  }
+  .status-btn:hover { background:rgba(255,255,255,.18); }
 </style>
 </head>
 <body>
@@ -74,14 +83,21 @@
   <div class="box" id="box">
     <div class="code" id="code">- - - -</div>
     <div class="copy" onclick="copyCode()">tap to copy</div>
+    <div class="timer" id="timer"></div>
     <div class="steps">
       <b>How to link:</b><br>
       1. Open WhatsApp on your phone<br>
       2. <b>Settings → Linked devices</b><br>
       3. Tap <b>Link a device</b><br>
       4. Tap <b>Link with phone number instead</b><br>
-      5. Enter the code above ⬆️
+      5. Enter the code above ⬆️<br>
+      <br>
+      <b>Code not working?</b> Tap the button again for a fresh code.
     </div>
+  </div>
+
+  <div class="status-row">
+    <button class="status-btn" onclick="checkStatus()">📊 Bot Status</button>
   </div>
 
   <footer>Powered by FAIZAN-MD · 162 plugins</footer>
@@ -89,17 +105,41 @@
 
 <script>
 const $ = id => document.getElementById(id);
+let timerInterval = null;
 
 function show(text, type) {
   const m = $('msg');
   m.textContent = text;
-  m.className = 'msg show ' + type;
+  m.className = 'msg show ' + (type || 'ok');
 }
 
 function copyCode() {
-  const c = $('code').textContent.replace(/[^0-9A-Za-z-]/g, '');
-  navigator.clipboard?.writeText(c);
-  show('Code copied ✅', 'ok');
+  const c = $('code').textContent.replace(/[^0-9A-Za-z]/g, '');
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(c).then(() => show('Code copied ✅', 'ok'));
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = c; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy');
+    document.body.removeChild(ta);
+    show('Code copied ✅', 'ok');
+  }
+}
+
+function startCodeTimer(seconds) {
+  if (timerInterval) clearInterval(timerInterval);
+  let remaining = seconds;
+  const update = () => {
+    if (remaining <= 0) {
+      $('timer').textContent = '⚠️ Code may have expired — tap the button again for a new one.';
+      clearInterval(timerInterval);
+      return;
+    }
+    $('timer').textContent = `Code expires in ${remaining}s`;
+    remaining--;
+  };
+  update();
+  timerInterval = setInterval(update, 1000);
 }
 
 async function pair() {
@@ -110,20 +150,25 @@ async function pair() {
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span> Requesting code...';
   $('box').className = 'box';
-  show('Connecting to WhatsApp — this can take 10-20 seconds...', 'ok');
+  if (timerInterval) clearInterval(timerInterval);
+  $('timer').textContent = '';
+  show('Connecting to WhatsApp — this can take 10–20 seconds...', 'ok');
 
   try {
     const res = await fetch('/pair?number=' + number);
     const data = await res.json();
 
     if (!res.ok || data.error) {
-      show(data.error || 'Failed, please try again', 'err');
+      show(data.error || 'Failed — please try again', 'err');
     } else if (data.status === 'already_paired') {
       show(data.message || 'This number is already linked ✅', 'ok');
-    } else {
+    } else if (data.status === 'pending') {
+      show(data.message || 'Pairing in progress — please wait...', 'info');
+    } else if (data.code) {
       $('code').textContent = data.code;
       $('box').className = 'box show';
       show('Code ready — enter it in WhatsApp within 60 seconds', 'ok');
+      startCodeTimer(60);
     }
   } catch (e) {
     show('Server error: ' + e.message, 'err');
@@ -131,6 +176,18 @@ async function pair() {
 
   btn.disabled = false;
   btn.textContent = 'Get Pairing Code';
+}
+
+async function checkStatus() {
+  try {
+    const res = await fetch('/status');
+    const data = await res.json();
+    const running = data.running?.length || 0;
+    const saved = data.saved_sessions?.length || 0;
+    show(`${data.bot} | Running: ${running} | Saved: ${saved} | Limit: ${data.limit}`, 'info');
+  } catch (e) {
+    show('Could not fetch status: ' + e.message, 'err');
+  }
 }
 
 $('num').addEventListener('keypress', e => { if (e.key === 'Enter') pair(); });
