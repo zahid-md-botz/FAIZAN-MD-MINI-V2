@@ -242,9 +242,6 @@ const clearTempDir = () => {
 
 setInterval(clearTempDir, 5 * 60 * 1000);
 
-//=============================================
-// express server now lives in index.js (pairing page + worker manager)
-
 // ============ ENSURE ASSETS FOLDER EXISTS ============
 const sudoPath = path.join(assetsDir, 'sudo.json');
 if (!fs.existsSync(sudoPath)) {
@@ -394,21 +391,20 @@ async function handleMessageUltra(message) {
 
 //=======SESSION-AUTH==============
 async function connectToWA() {
-    console.log(`[🔰] FAIZAN-MD Connecting WhatsApp for (${BOT_NUMBER})...`);
+    console.log("[🔰] FAIZAN-MD Connecting to WhatsApp ⏳️...");
     
+    // MongoDB session (mini style): survives restarts, no SESSION_ID needed
     const { state, saveCreds } = await useDiskAuthState(BOT_NUMBER);
 
-    // FIX: Don't kill worker process abruptly; retry if credentials are still syncing
+    // Guard: connecting with creds that never completed pairing earns an immediate
+    // 401, and the 401 branch below would then wipe the very session the user is in
+    // the middle of creating. Stop here and let the pairing page finish its job.
     if (!state.creds || !state.creds.registered) {
-        console.log(`[⚠️] ${BOT_NUMBER} keys are not fully registered yet. Waiting 5s...`);
-        await new Promise(r => setTimeout(r, 5000));
-        const recheck = await useDiskAuthState(BOT_NUMBER);
-        if (!recheck.state.creds.registered) {
-            console.log(`[❌] Credentials failed for ${BOT_NUMBER}. Exiting worker.`);
-            process.exit(1);
-        }
+        console.log(`[⚠️] ${BOT_NUMBER} is not paired yet — open the pairing page and enter the code. Not connecting.`);
+        process.exit(0);
     }
-
+    
+    // lib/ and data/ helpers reference bare conn
     let conn;
     const waLogger = P({ level: 'silent' });
     conn = makeWASocket({
@@ -418,15 +414,15 @@ async function connectToWA() {
         },
         logger: waLogger,
         printQRInTerminal: false,
-        connectTimeoutMs: 60000,
+        connectTimeoutMs: 120000, // FIX: Extended timeout for Railway / slower servers
         defaultQueryTimeoutMs: 0,
         keepAliveIntervalMs: 10000,
         emitOwnEvents: false,
         fireInitQueries: true,
         markOnlineOnConnect: true,
         generateHighQualityLinkPreview: true,
-        syncFullHistory: false,
-        browser: Browsers.macOS('Safari'),
+        syncFullHistory: true,
+        browser: Browsers.ubuntu('Firefox'), // FIX: Stable Ubuntu fingerprint for fast pairing & no endless loading
         ...proxyOptions(),
         getMessage: async (key) => {
             if (messageStore.has(key.id)) {
@@ -436,9 +432,8 @@ async function connectToWA() {
         }
     });
 
+    // Publish the live socket and replay the listeners the helpers registered at boot.
     connBridge.attach(conn);
-    // ... باقی main.js کا کوڈ ویسے ہی رہنے دو
-
 
     conn.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -455,13 +450,8 @@ async function connectToWA() {
             console.log(`❌ Connection closed - Status: ${statusCode}`);
             
             if (errorMsg.includes('Bad MAC') || errorMsg.includes('closed session') || statusCode === 401 || statusCode === 403) {
-                // Deleting here was destroying the login the user had just created:
-                // boot auto-connect -> 401 -> wipe -> "pairing never works".
-                // Flag it instead; only /delete removes a session now.
                 console.log(`⚠️ WhatsApp rejected this session (${statusCode}). NOT deleting it.`);
                 console.log('   Marked for re-pair, session kept.');
-                console.log('   If this repeats immediately after a successful pairing, WhatsApp is');
-                console.log('   refusing this host IP — set PROXY_URL (see lib/proxyAgent.js).');
                 try {
                     await markNeedsRepair(BOT_NUMBER, `status ${statusCode}`);
                 } catch (e) { console.error('could not flag session:', e.message); }
@@ -480,12 +470,16 @@ async function connectToWA() {
             // Load plugins
             const pluginPath = path.join(__dirname, 'plugins');
             let pluginCount = 0;
-            fs.readdirSync(pluginPath).forEach((plugin) => {
-                if (path.extname(plugin).toLowerCase() === ".js") {
-                    require(path.join(pluginPath, plugin));
-                    pluginCount++;
-                }
-            });
+            if (fs.existsSync(pluginPath)) {
+                fs.readdirSync(pluginPath).forEach((plugin) => {
+                    if (path.extname(plugin).toLowerCase() === ".js") {
+                        try {
+                            require(path.join(pluginPath, plugin));
+                            pluginCount++;
+                        } catch(e) {}
+                    }
+                });
+            }
             console.log('[🔰] Plugins installed successfully ✅');
 
             setTimeout(() => {
@@ -553,47 +547,28 @@ async function connectToWA() {
     
     // ============ STORE MESSAGES FOR ANTI-DELETE ============
     conn.ev.on('messages.upsert', async (m) => {
-        // FIX: iterate the whole batch, not just messages[0].
-        // Baileys can deliver several messages in one upsert event
-        // (e.g. multiple statuses arriving together) — only handling
-        // index 0 silently dropped the rest.
         for (const msg of m.messages) {
-        if (!msg.message) continue;
-        
-        if (msg.key.remoteJid === 'status@broadcast') continue;
-        
-        const messageKey = `${msg.key.remoteJid}_${msg.key.id}`;
-        messageStore.set(messageKey, {
-            message: msg,
-            sender: msg.key.participant || msg.key.remoteJid,
-            chat: msg.key.remoteJid,
-            timestamp: Date.now()
-        });
-        
-        // FIX: store with timestamp so it gets cleaned up like the other entry.
-        // Previously stored as raw msg (no .timestamp) → cleanup condition
-        // (value.timestamp && ...) never matched → Map grew forever → OOM.
-        messageStore.set(msg.key.id, { message: msg.message, timestamp: Date.now() });
-        
-        // Per-message cleanup is O(n) and runs on every single message —
-        // very expensive on busy bots. Removed here; scheduled interval below handles it.
+            if (!msg.message) continue;
+            
+            if (msg.key.remoteJid === 'status@broadcast') continue;
+            
+            const messageKey = `${msg.key.remoteJid}_${msg.key.id}`;
+            messageStore.set(messageKey, {
+                message: msg,
+                sender: msg.key.participant || msg.key.remoteJid,
+                chat: msg.key.remoteJid,
+                timestamp: Date.now()
+            });
+            
+            messageStore.set(msg.key.id, { message: msg.message, timestamp: Date.now() });
         }
     });
     
     /// READ STATUS AND CHANNEL AUTO REACT
     conn.ev.on('messages.upsert', async(upsertEvent) => {
-      // FIX: loop over the WHOLE batch, not just messages[0].
-      // Root cause of "auto status react sometimes doesn't fire":
-      // Baileys can deliver several messages/statuses in a single
-      // upsert event; only handling index 0 silently dropped the rest
-      // every time that happened.
       for (const mek of upsertEvent.messages) {
 
         // ============ STATUS AUTO SEEN & REACT ============
-        // FIX v4: moved BEFORE !mek.message check.
-        // In Baileys 7.x, status broadcast notifications arrive with message=null
-        // (metadata ping only). Previous position (after null check) caused
-        // this block to silently exit early → status react never worked.
         if (mek.key && mek.key.remoteJid === 'status@broadcast') {
             const statusPoster = mek.key.participant || mek.participant;
 
@@ -708,11 +683,9 @@ async function connectToWA() {
             try {
                 groupMetadata = await conn.groupMetadata(from);
                 if (groupMetadata) {
-                    // Update cache with fresh data
                     speedCache.groups.set(from, { data: groupMetadata, timestamp: Date.now() });
                 }
             } catch (e) {}
-            // Fallback to cache if live fetch failed
             if (!groupMetadata) {
                 const cached = speedCache.groups.get(from);
                 if (cached) groupMetadata = cached.data;
@@ -724,9 +697,7 @@ async function connectToWA() {
             }
         }
         
-        // Robust JID check: compare raw phone numbers to avoid multi-device format mismatches
         const botRawNum = conn.user.id.split(':')[0].split('@')[0];
-        // Fix: WhatsApp groups may use @lid JIDs. Get bot's LID from creds if available.
         const botLid = ((conn.authState?.creds?.me?.lid || conn.authState?.creds?.account?.lid || '').split('@')[0].split(':')[0]);
         const isBotAdmins = isGroup ? groupAdmins.some(a => {
             const aNum = a.split('@')[0];
@@ -739,7 +710,7 @@ async function connectToWA() {
         ) : false;
         const isReact = m.message.reactionMessage ? true : false;
         const reply = (teks) => {
-            if (teks === undefined || teks === null || teks === '') return; // FIX: prevent empty messages
+            if (teks === undefined || teks === null || teks === '') return;
             conn.sendMessage(from, { text: teks, contextInfo: globalContextInfo }, { quoted: mek });
         };
         
@@ -797,62 +768,88 @@ async function connectToWA() {
             const reactions = [
                 '🌼', '❤️', '💐', '🔥', '🏵️', '❄️', '🧊', '🐳', '💥', '🥀', '❤‍🔥', '🥹', '😩', '🫣', 
                 '🤭', '👻', '👾', '🫶', '😻', '🙌', '🫂', '🫀', '👩‍🦰', '🧑‍🦰', '👩‍⚕️', '🧑‍⚕️', '🧕', 
-                '👩‍🏫', '👨‍💻', '👰‍♀', '🦹🏻‍♀️', '🧟‍♀️', '🧟', '🧞‍♀️', '🧞', '🙅‍♀️', '💁‍♂️', '💁‍♀️', '🙆‍♀️', 
-                '🙋‍♀️', '🤷', '🤷‍♀️', '🤦', '🤦‍♀️', '💇‍♀️', '💇', '💃', '🚶‍♀️', '🚶', '🧶', '🧤', '👑', 
-                '💍', '👝', '💼', '🎒', '🥽', '🐻', '🐼', '🐭', '🐣', '🪿', '🦆', '🦊', '🦋', '🦄', 
-                '🪼', '🐋', '🐳', '🦈', '🐍', '🕊️', '🦦', '🦚', '🌱', '🍃', '🎍', '🌿', '☘️', '🍀', 
-                '🍁', '🪺', '🍄', '🍄‍🟫', '🪸', '🪨', '🌺', '🪷', '🪻', '🥀', '🌹', '🌷', '💐', '🌾', 
-                '🌸', '🌼', '🌻', '🌝', '🌚', '🌕', '🌎', '💫', '🔥', '☃️', '❄️', '🌨️', '🫧', '🍟', 
-                '🍫', '🧃', '🧊', '🪀', '🤿', '🏆', '🥇', '🥈', '🥉', '🎗️', '🤹', '🤹‍♀️', '🎧', '🎤', 
-                '🥁', '🧩', '🎯', '🚀', '🚁', '🗿', '🎙️', '⌛', '⏳', '💸', '💎', '⚙️', '⛓️', '🔪', 
-                '🧸', '🎀', '🪄', '🎈', '🎁', '🎉', '🏮', '🪩', '📩', '💌', '📤', '📦', '📊', '📈', 
-                '📑', '📉', '📂', '🔖', '🧷', '📌', '📝', '🔏', '🔐', '🩷', '❤️', '🧡', '💛', '💚', 
-                '🩵', '💙', '💜', '🖤', '🩶', '🤍', '🤎', '❤‍🔥', '❤‍🩹', '💗', '💖', '💘', '💝', '❌', 
-                '✅', '🔰', '〽️', '🌐', '🌀', '⤴️', '⤵️', '🔴', '🟢', '🟡', '🟠', '🔵', '🟣', '⚫', 
-                '⚪', '🟤', '🔇', '🔊', '📢', '🔕', '♥️', '🕐', '🚩', '🇵🇰'
+                '👩‍🏫', '👨‍💻', '👰‍♀', '🦹🏻‍♀️', '🧟‍♀️', '🧟', '🧞‍♀️', '🧞', '🧚‍♀️', '💆‍♀️', '💆‍♂️', '💅', '💅🏻', 
+                '🦚', '🍁', '🪸', '🍿', '🎗️', '🥇', '💍', '👑', '🌟', '💫', '⚡', '🌈', '✨', '🎀', 
+                '💖', '🌺', '🌷', '🌸', '🎁', '🎈', '🎉', '🎊', '🔮', '💎'
             ];
             const randomReaction = reactions[Math.floor(Math.random() * reactions.length)];
-            m.react(randomReaction);
-        }
-                              
-        // Custom React
-        if (!isReact && config.CUSTOM_REACT === 'true') {
-            const reactions = (config.CUSTOM_REACT_EMOJIS || '🥲,😂,👍🏻,🙂,😔').split(',');
-            const randomReaction = reactions[Math.floor(Math.random() * reactions.length)];
-            m.react(randomReaction);
+            
+            try {
+                await conn.sendMessage(from, {
+                    react: { text: randomReaction, key: mek.key }
+                });
+            } catch (e) {
+                console.log('[Auto React Error]', e.message);
+            }
         }
 
-        // ban users 
+        // Custom Auto React based on keywords
+        if (!isReact && config.CUSTOM_REACT === 'true') {
+            const reactionRules = [
+                { keywords: ['hi', 'hello', 'hey', 'hy', 'salam', 'assalam'], emojis: ['👋', '🙋‍♂️', '🌸', '✨', '🤝'] },
+                { keywords: ['love', 'pyar', 'mohabbat', 'like'], emojis: ['❤️', '💖', '🫀', '🥰', '😍', '💘'] },
+                { keywords: ['bot', 'faizan', 'alexa', 'ai'], emojis: ['🤖', '⚡', '💫', '👑', '🌟'] },
+                { keywords: ['good morning', 'morning', 'gm'], emojis: ['☀️', '🌅', '🌺', '☕'] },
+                { keywords: ['good night', 'night', 'gn'], emojis: ['🌙', '⭐', '😴', '💤'] },
+                { keywords: ['thanks', 'thank you', 'shukriya', 'thx'], emojis: ['😇', '🙏', '💖', '✨'] },
+                { keywords: ['sad', 'udass', 'dukh', 'crying', 'cry'], emojis: ['🥺', '💔', '😭', '🥀'] },
+                { keywords: ['happy', 'khush', 'enjoy', 'fun'], emojis: ['🎉', '🥳', '😃', '🎈'] },
+                { keywords: ['fire', 'attitude', 'op', 'pro'], emojis: ['🔥', '⚡', '😎', '💯', '👑'] },
+                { keywords: ['joke', 'haha', 'lol', 'funny'], emojis: ['😂', '🤣', '😆', '😹'] },
+                { keywords: ['bye', 'tata', 'allah hafiz'], emojis: ['👋', '🙋‍♂️', '🥀', '🥺'] },
+                { keywords: ['call', 'vc', 'voice'], emojis: ['📞', '🔊', '🎙️'] },
+                { keywords: ['song', 'music', 'gana'], emojis: ['🎵', '🎶', '🎧', '🎸'] },
+                { keywords: ['pic', 'dp', 'photo', 'image'], emojis: ['🖼️', '📸', '📷'] },
+                { keywords: ['video', 'vid'], emojis: ['🎬', '📹', '🎥'] },
+                { keywords: ['ok', 'okay', 'theek'], emojis: ['👍', '👌', '✅'] },
+                { keywords: ['congrats', 'congratulations', 'mubarak'], emojis: ['🎉', '🎊', '🥳', '🥂'] },
+                { keywords: ['win', 'jeet'], emojis: ['🏆', '🥇', '👑'] },
+                { keywords: ['study', 'padhai', 'exam'], emojis: ['📚', '📖', '✏️'] },
+                { keywords: ['food', 'khana', 'eat'], emojis: ['🍕', '🍔', '🍟', '🍰'] }
+            ];
+
+            const messageText = body.toLowerCase();
+            let matchedEmoji = null;
+
+            for (const rule of reactionRules) {
+                if (rule.keywords.some(keyword => messageText.includes(keyword))) {
+                    matchedEmoji = rule.emojis[Math.floor(Math.random() * rule.emojis.length)];
+                    break;
+                }
+            }
+
+            if (matchedEmoji) {
+                try {
+                    await conn.sendMessage(from, {
+                        react: { text: matchedEmoji, key: mek.key }
+                    });
+                } catch (e) {
+                    console.log('[Custom React Error]', e.message);
+                }
+            }
+        }
+            
         let bannedUsers = [];
         try {
             bannedUsers = JSON.parse(fs.readFileSync('./assets/ban.json', 'utf-8'));
         } catch (e) {
             bannedUsers = [];
         }
-        const isBanned = bannedUsers.includes(sender);
-        if (isBanned) return;
+        
+        if (bannedUsers.includes(sender)) return;
             
-        let ownerFile = [];
-        try {
-            ownerFile = JSON.parse(fs.readFileSync('./assets/sudo.json', 'utf-8'));
-        } catch (e) {
-            ownerFile = [];
-        }
-        const ownerNumberFormatted = `${config.OWNER_NUMBER}@s.whatsapp.net`;
-        const isFileOwner = ownerFile.includes(sender);
-        const isRealOwner = sender === ownerNumberFormatted || isMe || isFileOwner;
-        if (!isRealOwner && config.MODE === "private") return;
-        if (!isRealOwner && isGroup && config.MODE === "inbox") return;
-        if (!isRealOwner && !isGroup && config.MODE === "groups") return;
+        // Mode Controls
+        if (!isCreator && config.MODE === "private") return;
+        if (!isCreator && isGroup && config.MODE === "inbox") return;
+        if (!isCreator && !isGroup && config.MODE === "groups") return;
        
-        // take commands 
+        // Command Handler
         const events = require('./command');
-        const cmdName = isCmd ? body.slice(prefix.length).trim().split(" ")[0].toLowerCase() : false;
+        const cmdName = isCmd ? command : false;
         if (isCmd) {
             const cmd = events.commands.find((cmd) => cmd.pattern === (cmdName)) || events.commands.find((cmd) => cmd.alias && cmd.alias.includes(cmdName));
             if (cmd) {
                 if (cmd.react) conn.sendMessage(from, { react: { text: cmd.react, key: mek.key }});
-                
                 try {
                     cmd.function(conn, mek, m,{from, quoted, body, isCmd, command, args, q, text, isGroup, sender, senderNumber, botNumber2, botNumber, pushname, isMe, isOwner, isCreator, groupMetadata, groupName, participants, groupAdmins, isBotAdmins, isAdmins, reply});
                 } catch (e) {
@@ -861,7 +858,7 @@ async function connectToWA() {
             }
         }
         
-        events.commands.map(async(command) => {
+        events.commands.forEach(async(command) => {
             if (body && command.on === "body") {
                 command.function(conn, mek, m,{from, l, quoted, body, isCmd, command, args, q, text, isGroup, sender, senderNumber, botNumber2, botNumber, pushname, isMe, isOwner, isCreator, groupMetadata, groupName, participants, groupAdmins, isBotAdmins, isAdmins, reply});
             } else if (mek.q && command.on === "text") {
@@ -879,44 +876,40 @@ async function connectToWA() {
             }
         });
         
-      } // end for (const mek of upsertEvent.messages)
+      }
     });
-    
-    //===================================================   
-    conn.decodeJid = jid => {
+
+    // ============ HELPER EXTENSIONS ON CONN ============
+    conn.decodeJid = (jid) => {
         if (!jid) return jid;
         if (/:\d+@/gi.test(jid)) {
             let decode = jidDecode(jid) || {};
-            return (
-                (decode.user &&
-                    decode.server &&
-                    decode.user + '@' + decode.server) ||
-                jid
-            );
-        } else return jid;
-    };
-    
-    conn.copyNForward = async(jid, message, forceForward = false, options = {}) => {
-        let vtype
-        if (options.readViewOnce) {
-            message.message = message.message && message.message.ephemeralMessage && message.message.ephemeralMessage.message ? message.message.ephemeralMessage.message : (message.message || undefined)
-            vtype = Object.keys(message.message.viewOnceMessage.message)[0]
-            delete(message.message && message.message.ignore ? message.message.ignore : (message.message || undefined))
-            delete message.message.viewOnceMessage.message[vtype].viewOnce
-            message.message = {
-                ...message.message.viewOnceMessage.message
-            }
+            return decode.user && decode.server && decode.user + '@' + decode.server || jid;
         }
-      
-        let mtype = Object.keys(message.message)[0]
-        let content = await generateForwardMessageContent(message, forceForward)
-        let ctype = Object.keys(content)[0]
-        let context = {}
-        if (mtype != "conversation") context = message.message[mtype].contextInfo
+        return jid;
+    };
+
+    conn.copyNForward = async (jid, message, forceForward = false, options = {}) => {
+        let vtype;
+        if (options.readViewOnce) {
+            message.message = message.message && message.message.ephemeralMessage && message.message.ephemeralMessage.message ? message.message.ephemeralMessage.message : (message.message || undefined);
+            vtype = Object.keys(message.message)[0];
+            delete (message.message && message.message.ignore ? message.message.ignore : (message.message || undefined));
+            delete message.message[vtype].viewOnce;
+            message.message = {
+                ...message.message
+            };
+        }
+
+        let mtype = Object.keys(message.message)[0];
+        let content = await generateForwardMessageContent(message, forceForward);
+        let ctype = Object.keys(content)[0];
+        let context = {};
+        if (mtype != "conversation") context = message.message[mtype].contextInfo;
         content[ctype].contextInfo = {
             ...context,
             ...content[ctype].contextInfo
-        }
+        };
         const waMessage = await generateWAMessageFromContent(jid, content, options ? {
             ...content[ctype],
             ...options,
@@ -926,291 +919,255 @@ async function connectToWA() {
                     ...options.contextInfo
                 }
             } : {})
-        } : {})
-        await conn.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id })
-        return waMessage
-    }
-    
-    conn.downloadAndSaveMediaMessage = async(message, filename, attachExtension = true) => {
-        let quoted = message.msg ? message.msg : message
-        let mime = (message.msg || message).mimetype || ''
-        let messageType = message.mtype ? message.mtype.replace(/Message/gi, '') : mime.split('/')[0]
-        const stream = await downloadContentFromMessage(quoted, messageType)
-        let buffer = Buffer.from([])
+        } : {});
+        await conn.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
+        return waMessage;
+    };
+
+    conn.downloadAndSaveMediaMessage = async (message, filename, attachExtension = true) => {
+        let quoted = message.msg ? message.msg : message;
+        let mime = (message.msg || message).mimetype || '';
+        let messageType = message.mtype ? message.mtype.replace(/Message/gi, '') : mime.split('/')[0];
+        const stream = await downloadContentFromMessage(quoted, messageType);
+        let buffer = Buffer.from([]);
         for await (const chunk of stream) {
-            buffer = Buffer.concat([buffer, chunk])
+            buffer = Buffer.concat([buffer, chunk]);
         }
-        let type = await FileType.fromBuffer(buffer)
-        trueFileName = attachExtension ? (filename + '.' + type.ext) : filename
-        await fs.writeFileSync(trueFileName, buffer)
-        return trueFileName
-    }
-    
-    conn.downloadMediaMessage = async(message) => {
-        let mime = (message.msg || message).mimetype || ''
-        let messageType = message.mtype ? message.mtype.replace(/Message/gi, '') : mime.split('/')[0]
-        const stream = await downloadContentFromMessage(message, messageType)
-        let buffer = Buffer.from([])
+        let type = await FileType.fromBuffer(buffer);
+        trueFileName = attachExtension ? (filename + '.' + type.ext) : filename;
+        await fs.promises.writeFile(trueFileName, buffer);
+        return trueFileName;
+    };
+
+    conn.downloadMediaMessage = async (message) => {
+        let mime = (message.msg || message).mimetype || '';
+        let messageType = message.mtype ? message.mtype.replace(/Message/gi, '') : mime.split('/')[0];
+        const stream = await downloadContentFromMessage(message, messageType);
+        let buffer = Buffer.from([]);
         for await (const chunk of stream) {
-            buffer = Buffer.concat([buffer, chunk])
+            buffer = Buffer.concat([buffer, chunk]);
         }
-        return buffer
-    }
-    
+        return buffer;
+    };
+
     conn.sendFileUrl = async (jid, url, caption, quoted, options = {}) => {
-        let mime = '';
-        let res = await axios.head(url)
-        mime = res.headers['content-type']
-        if (mime.split("/")[1] === "gif") {
-            return conn.sendMessage(jid, { video: await getBuffer(url), caption: caption, gifPlayback: true, contextInfo: globalContextInfo, ...options }, { quoted: quoted, ...options })
-        }
-        let type = mime.split("/")[0] + "Message"
-        if (mime === "application/pdf") {
-            return conn.sendMessage(jid, { document: await getBuffer(url), mimetype: 'application/pdf', caption: caption, contextInfo: globalContextInfo, ...options }, { quoted: quoted, ...options })
-        }
+        let res = await axios.get(url, { responseType: 'arraybuffer' });
+        let buffer = Buffer.from(res.data, 'binary');
+        let type = await FileType.fromBuffer(buffer);
+        let mime = type.mime;
+        let pathFile = filename ? filename : getRandom('.' + type.ext);
+
+        await fs.promises.writeFile(pathFile, buffer);
+
         if (mime.split("/")[0] === "image") {
-            return conn.sendMessage(jid, { image: await getBuffer(url), caption: caption, contextInfo: globalContextInfo, ...options }, { quoted: quoted, ...options })
+            return conn.sendMessage(jid, { image: { url: pathFile }, caption: caption, ...options }, { quoted: quoted });
+        } else if (mime.split("/")[0] === "video") {
+            return conn.sendMessage(jid, { video: { url: pathFile }, caption: caption, mtype: 'video', ...options }, { quoted: quoted });
+        } else if (mime.split("/")[0] === "audio") {
+            return conn.sendMessage(jid, { audio: { url: pathFile }, caption: caption, mtype: 'audio', ...options }, { quoted: quoted });
+        } else {
+            return conn.sendMessage(jid, { document: { url: pathFile }, mimetype: mime, caption: caption, ...options }, { quoted: quoted });
         }
-        if (mime.split("/")[0] === "video") {
-            return conn.sendMessage(jid, { video: await getBuffer(url), caption: caption, mimetype: 'video/mp4', contextInfo: globalContextInfo, ...options }, { quoted: quoted, ...options })
-        }
-        if (mime.split("/")[0] === "audio") {
-            return conn.sendMessage(jid, { audio: await getBuffer(url), caption: caption, mimetype: 'audio/mpeg', contextInfo: globalContextInfo, ...options }, { quoted: quoted, ...options })
-        }
-    }
-    
+    };
+
     conn.cMod = (jid, copy, text = '', sender = conn.user.id, options = {}) => {
-        let mtype = Object.keys(copy.message)[0]
-        let isEphemeral = mtype === 'ephemeralMessage'
+        let mtype = Object.keys(copy.message)[0];
+        let isEphemeral = mtype === 'ephemeralMessage';
         if (isEphemeral) {
-            mtype = Object.keys(copy.message.ephemeralMessage.message)[0]
+            mtype = Object.keys(copy.message.ephemeralMessage.message)[0];
         }
-        let msg = isEphemeral ? copy.message.ephemeralMessage.message : copy.message
-        let content = msg[mtype]
-        if (typeof content === 'string') msg[mtype] = text || content
-        else if (content.caption) content.caption = text || content.caption
-        else if (content.text) content.text = text || content.text
+        let msg = isEphemeral ? copy.message.ephemeralMessage.message : copy.message;
+        let content = msg[mtype];
+        if (typeof content === 'string') msg[mtype] = text;
+        else if (content.caption) content.caption = text;
+        else if (content.text) content.text = text;
         if (typeof content !== 'string') msg[mtype] = {
             ...content,
             ...options
-        }
-        if (copy.key.participant) sender = copy.key.participant = sender || copy.key.participant
-        else if (copy.key.participant) sender = copy.key.participant = sender || copy.key.participant
-        if (copy.key.remoteJid.includes('@s.whatsapp.net')) sender = sender || copy.key.remoteJid
-        else if (copy.key.remoteJid.includes('@broadcast')) sender = sender || copy.key.remoteJid
-        copy.key.remoteJid = jid
-        copy.key.fromMe = sender === conn.user.id
-      
-        return proto.WebMessageInfo.fromObject(copy)
-    }
-    
-    conn.getFile = async(PATH, save) => {
-        let res
-        let data = Buffer.isBuffer(PATH) ? PATH : /^data:.*?\/.*?;base64,/i.test(PATH) ? Buffer.from(PATH.split `,` [1], 'base64') : /^https?:\/\//.test(PATH) ? await (res = await getBuffer(PATH)) : fs.existsSync(PATH) ? (filename = PATH, fs.readFileSync(PATH)) : typeof PATH === 'string' ? PATH : Buffer.alloc(0)
+        };
+        if (copy.key.participant) sender = copy.key.participant = sender || copy.key.participant;
+        else if (copy.key.participant) sender = copy.key.participant = sender || copy.key.participant;
+        if (copy.key.remoteJid.endsWith('@s.whatsapp.net')) sender = sender || copy.key.remoteJid;
+        else if (copy.key.remoteJid.endsWith('@broadcast')) sender = sender || copy.key.remoteJid;
+        copy.key.id = generateMessageID();
+        copy.key.fromMe = sender === conn.user.id;
+
+        return new proto.WebMessageInfo(copy);
+    };
+
+    conn.getFile = async (PATH, save) => {
+        let res;
+        let data = Buffer.isBuffer(PATH) ? PATH : /^data:.*?\/.*?;base64,/i.test(PATH) ? Buffer.from(PATH.split`,`[1], 'base64') : /^https?:\/\//.test(PATH) ? await (res = await getBuffer(PATH)) : fs.existsSync(PATH) ? fs.readFileSync(PATH) : typeof PATH === 'string' ? PATH : Buffer.alloc(0);
         let type = await FileType.fromBuffer(data) || {
             mime: 'application/octet-stream',
-            ext: '.bin'
-        }
-        let filename = path.join(__filename, __dirname + new Date * 1 + '.' + type.ext)
-        if (data && save) fs.promises.writeFile(filename, data)
+            ext: 'bin'
+        };
+        let filename = path.join(__filename, '../src/' + new Date * 1 + '.' + type.ext);
+        if (data && save) fs.promises.writeFile(filename, data);
         return {
             res,
             filename,
-            size: await getSizeMedia(data),
+            size: await fs.statSync(filename).size,
             ...type,
             data
-        }
-    }
-    
-    conn.sendFile = async(jid, PATH, fileName, quoted = {}, options = {}) => {
-        let types = await conn.getFile(PATH, true)
-        let { filename, size, ext, mime, data } = types
-        let type = '',
-            mimetype = mime,
-            pathFile = filename
-        if (options.asDocument) type = 'document'
-        if (options.asSticker || /webp/.test(mime)) {
-            let { writeExif } = require('./exif.js')
-            let media = { mimetype: mime, data }
-            pathFile = await writeExif(media, { packname: config.STICKER_NAME || 'FAIZAN-MD', author: config.OWNER_NAME || 'FAIZAN', categories: options.categories ? options.categories : [] })
-            await fs.promises.unlink(filename)
-            type = 'sticker'
-            mimetype = 'image/webp'
-        } else if (/image/.test(mime)) type = 'image'
-        else if (/video/.test(mime)) type = 'video'
-        else if (/audio/.test(mime)) type = 'audio'
-        else type = 'document'
-        await conn.sendMessage(jid, {
-            [type]: { url: pathFile },
-            mimetype,
-            fileName,
-            contextInfo: globalContextInfo,
-            ...options
-        }, { quoted, ...options })
-        return fs.promises.unlink(pathFile)
-    }
-    
-    conn.parseMention = async(text) => {
-        return [...text.matchAll(/@([0-9]{5,16}|0)/g)].map(v => v[1] + '@s.whatsapp.net')
-    }
-    
-    conn.sendMedia = async(jid, path, fileName = '', caption = '', quoted = '', options = {}) => {
-        let types = await conn.getFile(path, true)
-        let { mime, ext, res, data, filename } = types
+        };
+    };
+
+    conn.sendFile = async (jid, PATH, filename = '', caption = '', quoted, ptt = false, options = {}) => {
+        let type = await conn.getFile(PATH, true);
+        let { res, data: file, filename: pathFile } = type;
         if (res && res.status !== 200 || file.length <= 65536) {
-            try { throw { json: JSON.parse(file.toString()) } } catch (e) { if (e.json) throw e.json }
+            try { throw { json: JSON.parse(file.toString()) } }
+            catch (e) { if (e.json) throw e.json }
         }
-        let type = '',
-            mimetype = mime,
-            pathFile = filename
-        if (options.asDocument) type = 'document'
-        if (options.asSticker || /webp/.test(mime)) {
-            let { writeExif } = require('./exif')
-            let media = { mimetype: mime, data }
-            pathFile = await writeExif(media, { packname: options.packname ? options.packname : config.BOT_NAME, author: options.author ? options.author : config.OWNER_NAME, categories: options.categories ? options.categories : [] })
-            await fs.promises.unlink(filename)
-            type = 'sticker'
-            mimetype = 'image/webp'
-        } else if (/image/.test(mime)) type = 'image'
-        else if (/video/.test(mime)) type = 'video'
-        else if (/audio/.test(mime)) type = 'audio'
-        else type = 'document'
-        await conn.sendMessage(jid, {
-            [type]: { url: pathFile },
+        let opt = { filename };
+        if (quoted) opt.quoted = quoted;
+        let mtype = '', mimetype = type.mime;
+        if (/webp/.test(type.mime)) mtype = 'sticker';
+        else if (/image/.test(type.mime)) mtype = 'image';
+        else if (/video/.test(type.mime)) mtype = 'video';
+        else if (/audio/.test(type.mime)) {
+            mtype = 'audio';
+            mimetype = 'audio/mp4';
+        } else mtype = 'document';
+        return await conn.sendMessage(jid, {
+            ...options,
             caption,
-            mimetype,
-            fileName,
-            contextInfo: globalContextInfo,
+            ptt,
+            [mtype]: { url: pathFile },
+            mimetype
+        }, {
+            ...opt,
             ...options
-        }, { quoted, ...options })
-        return fs.promises.unlink(pathFile)
-    }
-    
-    conn.sendVideoAsSticker = async (jid, buff, options = {}) => {
+        });
+    };
+
+    conn.parseMention = (text = '') => {
+        return [...text.matchAll(/@([0-9]{5,16}|0)/g)].map(v => v[1] + '@s.whatsapp.net');
+    };
+
+    conn.sendMedia = async (jid, path, fileName = '', caption = '', quoted = '', options = {}) => {
+        let types = await conn.getFile(path, true);
+        let { mime, ext, res, data, filename } = types;
+        if (res && res.status !== 200 || file.length <= 65536) {
+            try { throw { json: JSON.parse(file.toString()) } }
+            catch (e) { if (e.json) throw e.json }
+        }
+        let type = '', mimetype = mime, pathFile = filename;
+        if (options.asDocument) type = 'document';
+        if (options.asSticker || /webp/.test(mime)) {
+            let { writeExif } = require('./lib/exif');
+            let media = { mimetype: mime, data };
+            pathFile = await writeExif(media, { packname: options.packname ? options.packname : config.packname, author: options.author ? options.author : config.author, categories: options.categories ? options.categories : [] });
+            await fs.promises.unlink(filename);
+            type = 'sticker';
+            mimetype = 'image/webp';
+        }
+        else if (/image/.test(mime)) type = 'image';
+        else if (/video/.test(mime)) type = 'video';
+        else if (/audio/.test(mime)) type = 'audio';
+        else type = 'document';
+        await conn.sendMessage(jid, { [type]: { url: pathFile }, caption, mimetype, ...options }, { quoted, ...options });
+        return fs.promises.unlink(pathFile);
+    };
+
+    conn.sendVideoAsSticker = async (jid, path, quoted, options = {}) => {
+        let buff = Buffer.isBuffer(path) ? path : /^data:.*?\/.*?;base64,/i.test(path) ? Buffer.from(path.split`,`[1], 'base64') : /^https?:\/\//.test(path) ? await (await getBuffer(path)) : fs.existsSync(path) ? fs.readFileSync(path) : Buffer.alloc(0);
         let buffer;
         if (options && (options.packname || options.author)) {
             buffer = await writeExifVid(buff, options);
         } else {
             buffer = await videoToWebp(buff);
         }
-        await conn.sendMessage(
-            jid,
-            { sticker: { url: buffer }, contextInfo: globalContextInfo, ...options },
-            options
-        );
+
+        await conn.sendMessage(jid, { sticker: { url: buffer }, ...options }, { quoted });
+        return buffer;
     };
-    
-    conn.sendImageAsSticker = async (jid, buff, options = {}) => {
+
+    conn.sendImageAsSticker = async (jid, path, quoted, options = {}) => {
+        let buff = Buffer.isBuffer(path) ? path : /^data:.*?\/.*?;base64,/i.test(path) ? Buffer.from(path.split`,`[1], 'base64') : /^https?:\/\//.test(path) ? await (await getBuffer(path)) : fs.existsSync(path) ? fs.readFileSync(path) : Buffer.alloc(0);
         let buffer;
         if (options && (options.packname || options.author)) {
             buffer = await writeExifImg(buff, options);
         } else {
             buffer = await imageToWebp(buff);
         }
-        await conn.sendMessage(
-            jid,
-            { sticker: { url: buffer }, contextInfo: globalContextInfo, ...options },
-            options
-        );
+
+        await conn.sendMessage(jid, { sticker: { url: buffer }, ...options }, { quoted });
+        return buffer;
     };
-    
-    conn.sendTextWithMentions = async(jid, text, quoted, options = {}) => conn.sendMessage(jid, { text: text, contextInfo: { mentionedJid: [...text.matchAll(/@(\d{0,16})/g)].map(v => v[1] + '@s.whatsapp.net') }, ...options }, { quoted })
-    
-    conn.sendImage = async(jid, path, caption = '', quoted = '', options) => {
-        let buffer = Buffer.isBuffer(path) ? path : /^data:.*?\/.*?;base64,/i.test(path) ? Buffer.from(path.split `,` [1], 'base64') : /^https?:\/\//.test(path) ? await (await getBuffer(path)) : fs.existsSync(path) ? fs.readFileSync(path) : Buffer.alloc(0)
-        return await conn.sendMessage(jid, { image: buffer, caption: caption, contextInfo: globalContextInfo, ...options }, { quoted })
-    }
-    
-    conn.sendText = (jid, text, quoted = '', options) => conn.sendMessage(jid, { text: text, contextInfo: globalContextInfo, ...options }, { quoted })
-    
+
+    conn.sendTextWithMentions = async (jid, text, quoted, options = {}) => conn.sendMessage(jid, { text: text, mentions: [...text.matchAll(/@(\d{0,16})/g)].map(v => v[1] + '@s.whatsapp.net'), ...options }, { quoted });
+
+    conn.sendImage = async (jid, path, caption = '', quoted = '', options) => {
+        let buffer = Buffer.isBuffer(path) ? path : /^data:.*?\/.*?;base64,/i.test(path) ? Buffer.from(path.split`,`[1], 'base64') : /^https?:\/\//.test(path) ? await (await getBuffer(path)) : fs.existsSync(path) ? fs.readFileSync(path) : Buffer.alloc(0);
+        return await conn.sendMessage(jid, { image: buffer, caption: caption, ...options }, { quoted });
+    };
+
+    conn.sendText = (jid, text, quoted = '', options) => conn.sendMessage(jid, { text: text, ...options }, { quoted });
+
     conn.sendButtonText = (jid, buttons = [], text, footer, quoted = '', options = {}) => {
+        let buttonDetails = buttons.map(b => ({
+            buttonId: b.id,
+            buttonText: { displayText: b.text },
+            type: 1
+        }));
+
         let buttonMessage = {
             text,
             footer,
-            buttons,
-            headerType: 2,
-            contextInfo: globalContextInfo,
-            ...options
-        }
-        conn.sendMessage(jid, buttonMessage, { quoted, ...options })
-    }
-    
-    conn.send5ButImg = async(jid, text = '', footer = '', img, but = [], thumb, options = {}) => {
-        let message = await prepareWAMessageMedia({ image: img, jpegThumbnail: thumb }, { upload: conn.waUploadToServer })
-        var template = generateWAMessageFromContent(jid, proto.Message.fromObject({
+            buttons: buttonDetails,
+            headerType: 1
+        };
+
+        conn.sendMessage(jid, buttonMessage, { quoted, ...options });
+    };
+
+    conn.send5ButImg = async (jid, text = '', footer = '', img, buttons = [], options = {}) => {
+        let message = await prepareWAMessageMedia({ image: img }, { upload: conn.waUploadToServer });
+        let template = generateWAMessageFromContent(jid, {
             templateMessage: {
                 hydratedTemplate: {
                     imageMessage: message.imageMessage,
-                    "hydratedContentText": text,
-                    "hydratedFooterText": footer,
-                    "hydratedButtons": but
+                    hydratedContentText: text,
+                    hydratedFooterText: footer,
+                    hydratedButtons: buttons
                 }
             }
-        }), options)
-        conn.relayMessage(jid, template.message, { messageId: template.key.id })
-    }
-    
+        }, options);
+        conn.relayMessage(jid, template.message, { messageId: template.key.id });
+    };
+
     conn.getName = (jid, withoutContact = false) => {
         id = conn.decodeJid(jid);
         withoutContact = conn.withoutContact || withoutContact;
         let v;
-        if (id.endsWith('@g.us'))
-            return new Promise(async resolve => {
-                v = store.contacts[id] || {};
-                if (!(v.name.notify || v.subject))
-                    v = conn.groupMetadata(id) || {};
-                resolve(
-                    v.name ||
-                        v.subject ||
-                        PhoneNumber(
-                            '+' + id.replace('@s.whatsapp.net', ''),
-                        ).getNumber('international'),
-                );
-            });
-        else
-            v =
-                id === '0@s.whatsapp.net'
-                    ? {
-                            id,
-                            name: 'WhatsApp',
-                      }
-                    : id === conn.decodeJid(conn.user.id)
-                    ? conn.user
-                    : store.contacts[id] || {};
-
-        return (
-            (withoutContact ? '' : v.name) ||
-            v.subject ||
-            v.verifiedName ||
-            PhoneNumber(
-                '+' + jid.replace('@s.whatsapp.net', ''),
-            ).getNumber('international')
-        );
+        if (id.endsWith("@g.us")) return new Promise(async (resolve) => {
+            v = speedCache.groups.get(id) || {};
+            if (!(v.name || v.subject)) v = await conn.groupMetadata(id) || {};
+            resolve(v.name || v.subject || PhoneNumber('+' + id.replace('@s.whatsapp.net', '')).getNumber('international'));
+        });
+        else v = id === '0@s.whatsapp.net' ? {
+            id,
+            name: 'WhatsApp'
+        } : id === conn.decodeJid(conn.user.id) ?
+            conn.user :
+            (speedCache.users.get(id) || {});
+        return (withoutContact ? '' : v.name) || v.subject || v.verifiedName || PhoneNumber('+' + id.replace('@s.whatsapp.net', '')).getNumber('international');
     };
 
     conn.sendContact = async (jid, kon, quoted = '', opts = {}) => {
         let list = [];
         for (let i of kon) {
             list.push({
-                displayName: await conn.getName(i + '@s.whatsapp.net'),
-                vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${await conn.getName(i + '@s.whatsapp.net')}\nFN:${config.OWNER_NAME}\nitem1.TEL;waid=${i}:${i}\nitem1.X-ABLabel:Click here to chat\nitem2.EMAIL;type=INTERNET:${config.OWNER_EMAIL || ''}\nitem2.X-ABLabel:Email\nitem3.URL:${config.REPO || ''}\nitem3.X-ABLabel:GitHub\nitem4.ADR:;;${config.LOCATION || ''};;;;\nitem4.X-ABLabel:Region\nEND:VCARD`,
+                displayName: await conn.getName(i),
+                vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${await conn.getName(i)}\nFN:${await conn.getName(i)}\nitem1.TEL;waid=${i.split('@')[0]}:${i.split('@')[0]}\nitem1.X-ABLabel:Mobile\nEND:VCARD`
             });
         }
-        conn.sendMessage(
-            jid,
-            {
-                contacts: {
-                    displayName: `${list.length} Contact`,
-                    contacts: list,
-                },
-                contextInfo: globalContextInfo,
-                ...opts,
-            },
-            { quoted },
-        );
+        conn.sendMessage(jid, { contacts: { displayName: `${list.length} Contact`, contacts: list }, ...opts }, { quoted });
     };
 
-    conn.setStatus = status => {
+    conn.setStatus = (status) => {
         conn.query({
             tag: 'iq',
             attrs: {
@@ -1218,26 +1175,25 @@ async function connectToWA() {
                 type: 'set',
                 xmlns: 'status',
             },
-            content: [
-                {
-                    tag: 'status',
-                    attrs: {},
-                    content: Buffer.from(status, 'utf-8'),
-                },
-            ],
+            content: [{
+                tag: 'status',
+                attrs: {},
+                content: Buffer.from(status, 'utf-8')
+            }]
         });
         return status;
     };
-    
-    conn.serializeM = mek => sms(conn, mek);
-    
+
+    conn.serializeM = (m) => sms(conn, m);
+
     return conn;
 }
 
-// ── worker entrypoint: connect this number ─────────────────────────────
-module.exports = { connectToWA };
+// Fixed Export Structure — both connectToWA and conn are exported together cleanly
+module.exports = { connectToWA, conn: connBridge };
 
 if (require.main === module) {
+    // Spawned directly: run immediately
     setTimeout(() => {
         connectToWA().catch(e => {
             console.error('[❌] Fatal start error:', e);
@@ -1246,22 +1202,17 @@ if (require.main === module) {
     }, 2000);
 }
 
+// Process Error Handling & Memory Cleaners
 process.on('SIGINT', () => {
-    console.log('Cleaning up before exit...');
+    console.log('Received SIGINT. Cleaning up interval...');
     if (memoryCleanInterval) clearInterval(memoryCleanInterval);
     process.exit(0);
 });
 
 process.on('uncaughtException', (err) => {
-    // A bare message ("conn is not defined") gave no way to tell which file threw.
     console.error('Uncaught Exception:', err.message);
-    if (err.stack) console.error(err.stack);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
-
-module.exports = {
-    conn
-};
