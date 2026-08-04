@@ -404,6 +404,18 @@ async function connectToWA() {
         process.exit(0);
     }
     
+    // FIX: fetchLatestBaileysVersion was imported but never called — Baileys' bundled
+    // default WA Web version can lag behind and cause the exact "connects then dies /
+    // endless linking" symptoms (see WhiskeySockets/Baileys#2679). Same fix as index.js's
+    // pairing socket, applied here so the worker's own reconnects use a current version too.
+    let waVersion;
+    try {
+        ({ version: waVersion } = await fetchLatestBaileysVersion());
+        console.log(`[ℹ️] ${BOT_NUMBER}: using WA Web version ${waVersion.join('.')}`);
+    } catch (e) {
+        console.error('[⚠️] fetchLatestBaileysVersion failed, using library default:', e.message);
+    }
+
     // lib/ and data/ helpers reference bare conn
     let conn;
     const waLogger = P({ level: 'silent' });
@@ -412,6 +424,7 @@ async function connectToWA() {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, waLogger),
         },
+        ...(waVersion ? { version: waVersion } : {}),
         logger: waLogger,
         printQRInTerminal: false,
         connectTimeoutMs: 120000, // FIX: Extended timeout for Railway / slower servers
@@ -448,8 +461,25 @@ async function connectToWA() {
             const errorMsg = lastDisconnect?.error?.message || '';
             
             console.log(`❌ Connection closed - Status: ${statusCode}`);
-            
-            if (errorMsg.includes('Bad MAC') || errorMsg.includes('closed session') || statusCode === 401 || statusCode === 403) {
+
+            // FIX (leak): statusCode 401 IS DisconnectReason.loggedOut — WhatsApp itself
+            // told us the device was unlinked/logged out. That session can never be
+            // resumed, so per the cleanup requirement it must be fully purged (Mongo +
+            // disk), not kept around "for repair". This used to fall into the same
+            // bucket as Bad-MAC/403 below and just sat in Mongo forever — deleteSession
+            // was imported but never called anywhere in this file.
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log(`⚠️ ${BOT_NUMBER}: WhatsApp logged this device out. Purging session (Mongo + disk).`);
+                try {
+                    await deleteSession(BOT_NUMBER);
+                } catch (e) { console.error('could not purge session:', e.message); }
+                process.exit(0);
+            }
+
+            // Bad MAC / closed-session decrypt errors and 403s are usually transient key
+            // desync, not a deliberate logout — keep the session and flag it instead of
+            // wiping it (this is the fix for the earlier "wipe destroyed fresh logins" bug).
+            if (errorMsg.includes('Bad MAC') || errorMsg.includes('closed session') || statusCode === 403) {
                 console.log(`⚠️ WhatsApp rejected this session (${statusCode}). NOT deleting it.`);
                 console.log('   Marked for re-pair, session kept.');
                 try {
@@ -457,13 +487,9 @@ async function connectToWA() {
                 } catch (e) { console.error('could not flag session:', e.message); }
                 process.exit(0);
             }
-            
-            if (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut) {
-                console.log('[🔰] Connection lost, reconnecting...');
-                setTimeout(connectToWA, 5000);
-            } else {
-                console.log('[🔰] Connection closed, please change session ID');
-            }
+
+            console.log('[🔰] Connection lost, reconnecting...');
+            setTimeout(connectToWA, 5000);
         } else if (connection === 'open') {
             console.log('[🔰] FAIZAN-MD connected to WhatsApp ✅');
             

@@ -92,13 +92,14 @@ async function generatePairCode(number) {
         return { inProgress: true };
     }
     locks.add(number);
-    setTimeout(() => locks.delete(number), 180000);
+    const lockTimeout = setTimeout(() => locks.delete(number), 180000);
 
     let { state, saveCreds, clear } = await useDiskAuthState(number);
 
-    // FIX 1: Jeśli numer jest w pełni zarejestrowany w WhatsApp
+    // FIX 1: number already has a completed registration
     if (state.creds && state.creds.registered) {
         locks.delete(number);
+        clearTimeout(lockTimeout);
         return { alreadyPaired: true };
     }
 
@@ -107,12 +108,25 @@ async function generatePairCode(number) {
     await clear().catch(() => {});
     ({ state, saveCreds, clear } = await useDiskAuthState(number));
 
+    // FIX 3: Baileys' bundled default WA Web version can lag behind and silently block
+    // device linking (code is issued but the phone never gets the prompt, or "Couldn't
+    // link device" — see WhiskeySockets/Baileys#2679, July 2026). fetchLatestBaileysVersion
+    // was already imported here but never actually called.
+    let version;
+    try {
+        ({ version } = await fetchLatestBaileysVersion());
+        console.log(`[ℹ️] Using WA Web version ${version.join('.')}`);
+    } catch (e) {
+        console.error('[⚠️] fetchLatestBaileysVersion failed, using library default:', e.message);
+    }
+
     const pairLogger = pino({ level: 'silent' });
     const sock = makeWASocket({
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pairLogger),
         },
+        ...(version ? { version } : {}),
         printQRInTerminal: false,
         logger: pairLogger,
         connectTimeoutMs: 60000,
@@ -121,43 +135,84 @@ async function generatePairCode(number) {
         emitOwnEvents: false,
         fireInitQueries: false,
         markOnlineOnConnect: false,
-        syncFullHistory: false, // FIX 3: Prevents endless loading screen on phone
-        browser: Browsers.macOS('Desktop'), // FIX 4: Stable macOS desktop agent prevents rejection
+        syncFullHistory: false,
+        browser: Browsers.macOS('Desktop'),
         ...proxyOptions(),
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
-        if (connection === 'open') {
-            console.log(`[✅] ${number} paired successfully — finishing session sync...`);
-            await saveCreds();
-            setTimeout(async () => {
-                try { await saveCreds(); } catch (e) {}
-                console.log(`[💾] ${number} session stored — starting bot`);
-                try { sock.ws.close(); } catch (e) {}
-                pairing.delete(number);
-                locks.delete(number);
-                startWorker(number);
-            }, 5000);
-        }
-        if (connection === 'close') {
-            const code = lastDisconnect?.error?.output?.statusCode;
-            locks.delete(number);
-            if (code === DisconnectReason.loggedOut || code === 401 || code === 403) {
-                console.log(`[⚠️] Pairing failed for ${number} (${code}) — clearing partial session`);
-                await clear().catch(() => {});
-            }
-        }
-    });
+    let codeRequested = false;
 
-    await new Promise(r => setTimeout(r, 2000));
-    const code = await sock.requestPairingCode(number);
-    const pretty = code?.match(/.{1,4}/g)?.join('-') || code;
-    pairing.set(number, { code: pretty, at: Date.now() });
-    console.log(`[🔗] Pairing code for ${number}: ${pretty}`);
-    return { code: pretty };
+    return await new Promise((resolve) => {
+        let settled = false;
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(lockTimeout);
+            resolve(result);
+        };
+
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
+
+            // FIX 4 (root cause of "code generates but phone never rings"): the old code
+            // called requestPairingCode() after a blind 2s setTimeout, guessing the raw
+            // socket was open by then. On a slower host (Heroku/Railway dyno spin-up,
+            // proxy hop) 2s isn't always enough — requestPairingCode is sent over a socket
+            // that isn't actually ready, WhatsApp accepts the HTTP-level request but the
+            // registration IQ never lands, so a code is returned to your UI but WhatsApp's
+            // server never pushes the phone-side prompt. Official Baileys pattern instead:
+            // request the code once the socket itself reports 'connecting' / hands you a qr
+            // ref — i.e. once it's actually ready to accept the registration IQ.
+            if ((connection === 'connecting' || qr) && !codeRequested && !state.creds.registered) {
+                codeRequested = true;
+                try {
+                    const code = await sock.requestPairingCode(number);
+                    const pretty = code?.match(/.{1,4}/g)?.join('-') || code;
+                    pairing.set(number, { code: pretty, at: Date.now() });
+                    console.log(`[🔗] Pairing code for ${number}: ${pretty}`);
+                    finish({ code: pretty });
+                } catch (e) {
+                    console.error(`[❌] requestPairingCode failed for ${number}:`, e.message);
+                    locks.delete(number);
+                    pairing.delete(number);
+                    try { sock.ws.close(); } catch (_) {}
+                    finish({ error: e.message || 'Failed to request pairing code, try again' });
+                }
+            }
+
+            if (connection === 'open') {
+                console.log(`[✅] ${number} paired successfully — finishing session sync...`);
+                await saveCreds();
+                setTimeout(async () => {
+                    try { await saveCreds(); } catch (e) {}
+                    console.log(`[💾] ${number} session stored — starting bot`);
+                    try { sock.ws.close(); } catch (e) {}
+                    pairing.delete(number);
+                    locks.delete(number);
+                    startWorker(number);
+                }, 5000);
+            }
+
+            if (connection === 'close') {
+                const code = lastDisconnect?.error?.output?.statusCode;
+                locks.delete(number);
+                // FIX 5: always drop the cached code + close the socket on ANY close, not
+                // just loggedOut/401/403 — otherwise a stale code can be left sitting in
+                // the `pairing` map (reused by the /pair route) after a silent mid-handshake
+                // drop, which is exactly what "endless Linking Device..." looks like from
+                // the phone's side — it's holding a code for a socket that already died.
+                pairing.delete(number);
+                try { sock.ws.close(); } catch (_) {}
+                if (code === DisconnectReason.loggedOut || code === 401 || code === 403) {
+                    console.log(`[⚠️] Pairing failed for ${number} (${code}) — clearing partial session`);
+                    await clear().catch(() => {});
+                }
+                finish({ error: `Connection closed before pairing completed (status ${code || 'unknown'})` });
+            }
+        });
+    });
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -197,6 +252,9 @@ app.get('/pair', async (req, res) => {
         if (result.alreadyPaired) {
             startWorker(number);
             return res.json({ status: 'already_paired', message: 'Already linked — bot started.' });
+        }
+        if (result.error) {
+            return res.status(502).json({ error: result.error });
         }
         return res.json({ status: 'ok', code: result.code });
     } catch (err) {
