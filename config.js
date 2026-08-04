@@ -7,7 +7,8 @@ function convertToBool(text, fault = 'true') {
 module.exports = {
 SESSION_ID: process.env.SESSION_ID || "",
 // not needed in mini bot (pairing code is used) - kept for compatibility
-MONGODB_URI: process.env.MONGODB_URI || "mmongodb+srv://z7661877_db_user:mzDdJP3WDPCCoUxd@cluster0.ffcjq7q.mongodb.net/",
+MONGODB_URI: process.env.MONGODB_URI || "mongodb+srv://z7661877_db_user:mzDdJP3WDPCCoUxd@cluster0.ffcjq7q.mongodb.net/?retryWrites=true&w=majority
+",
 // MongoDB connection string - sessions are stored here (multi-number)
 MAX_BOTS: process.env.MAX_BOTS || "3",
 // how many numbers can run on this deploy (each number ~200MB RAM)
