@@ -396,17 +396,18 @@ async function connectToWA() {
     // MongoDB session (mini style): survives restarts, no SESSION_ID needed
     const { state, saveCreds } = await useDiskAuthState(BOT_NUMBER);
 
-    // Guard: connecting with creds that never completed pairing earns an immediate
-    // 401, and the 401 branch below would then wipe the very session the user is in
-    // the middle of creating. Stop here and let the pairing page finish its job.
+    // ══════════════════════════════════════════════════════════════
+    //  BUG FIX: Exit immediately if not registered.
+    //  The old code did a 5-minute wait + return, burning RAM for
+    //  nothing. Workers are only ever started by index.js AFTER
+    //  pairing completes (with a 5s delay), so creds.registered
+    //  should always be true when this runs. If it isn't, something
+    //  went wrong in the pairing flow — exit clean and let the user
+    //  re-pair from the pairing page.
+    // ══════════════════════════════════════════════════════════════
     if (!state.creds || !state.creds.registered) {
-    console.log(`[⚠️] ${BOT_NUMBER} is not paired yet. Waiting for pairing to complete...`);
-    // Exit after 5 minutes if still not paired
-    setTimeout(() => {
-        console.log(`[⏰] ${BOT_NUMBER} pairing timeout. Exiting.`);
+        console.log(`[⚠️] ${BOT_NUMBER} is not registered yet — open the pairing page and enter the code. Exiting.`);
         process.exit(0);
-    }, 300000);
-    return; // Don't exit immediately, wait for pairing
     }
     
     // FIX: fetchLatestBaileysVersion was imported but never called — Baileys' bundled

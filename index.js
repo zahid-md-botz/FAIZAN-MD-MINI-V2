@@ -1,14 +1,18 @@
 /**
  * FAIZAN-MD MINI — pairing server + multi-number worker manager.
  *
- * PAIRING FIX (transplanted from Reference Bot / KADIYA-MD):
- *  - Replaced event-driven requestPairingCode() (waiting for 'connecting' event)
- *    with the Reference bot's proven direct-call approach:
- *    delay(1500) → requestPairingCode() with 3-retry loop → return code immediately.
- *  - Browser fingerprint changed to Browsers.ubuntu('Chrome') — same as Reference bot.
- *  - fireInitQueries kept false during pairing socket (lighter, faster handshake).
- *  - Post-pairing 'connection.update' handler kept for open/close lifecycle only.
- *  - All worker manager, routes, session imports and boot logic UNCHANGED.
+ * ROOT CAUSE FIX (both bugs solved):
+ *
+ * BUG 1 — Race condition in generatePairCode (main cause of "bot never sends notification"):
+ *   The old code attached the connection.update listener AFTER requestPairingCode() returned.
+ *   If the user entered the code quickly, connection === 'open' fired BEFORE the listener was
+ *   attached → startWorker() was never called → bot never started → no welcome message.
+ *   FIX: Attach ALL event listeners first, then request the code inside a Promise.
+ *
+ * BUG 2 — Pairing code timing (cause of "code generated but phone never gets prompt"):
+ *   The old delay(1500) was a blind wait. If the server was slow, the socket wasn't ready.
+ *   FIX: Use the 'qr' event as the trigger (socket is 100% ready when qr fires) with a
+ *   3-second fallback timer in case qr doesn't fire on this Baileys version.
  */
 
 const express = require('express');
@@ -33,7 +37,6 @@ const app = express();
 const PORT = process.env.PORT || 8000;
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || '3', 10);
 
-// ── small helper so we can await a plain setTimeout ──────────────────────────
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 app.use(bodyParser.json());
@@ -41,9 +44,9 @@ app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'assets')));
 
 // ════════════════════════════════════════════════════════════════
-//  WORKER MANAGER — one child process per WhatsApp number
+//  WORKER MANAGER
 // ════════════════════════════════════════════════════════════════
-const workers = new Map();   // number -> { proc, restarts, startedAt }
+const workers = new Map();
 
 function startWorker(number) {
     number = String(number).replace(/[^0-9]/g, '');
@@ -67,7 +70,7 @@ function startWorker(number) {
         if (code === 0) return;
         const restarts = entry.restarts + 1;
         if (restarts > 5) {
-            console.log(`[⛔] Bot ${number} crashed ${restarts}x — not restarting. Re-pair from the pairing page.`);
+            console.log(`[⛔] Bot ${number} crashed ${restarts}x — not restarting.`);
             return;
         }
         const delayMs = Math.min(60000, 5000 * restarts);
@@ -91,61 +94,47 @@ function stopWorker(number) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  PAIRING — transplanted from Reference Bot (KADIYA-MD / EmpirePair)
-//
-//  KEY CHANGE: instead of waiting for the Baileys 'connecting' event
-//  before calling requestPairingCode(), we use the Reference bot's
-//  proven pattern: create the socket, wait a fixed 1500 ms for the
-//  WebSocket handshake to settle, then call requestPairingCode()
-//  directly with a 3-retry loop.  This avoids the race condition where
-//  the 'connecting' event fires before the socket's internal signal-key
-//  store is fully initialised, which caused "code returned to UI but
-//  phone never gets the prompt" or endless spinner on slower hosts.
+//  PAIRING — complete rewrite fixing both race conditions
 // ════════════════════════════════════════════════════════════════
-const pairing = new Map();  // number -> { code, at }
+const pairing = new Map();
 const locks = new Set();
 
 async function generatePairCode(number) {
-    // ── duplicate-request guard ───────────────────────────────────
     if (locks.has(number)) {
         const known = pairing.get(number);
         if (known) return { code: known.code, reused: true };
         return { inProgress: true };
     }
     locks.add(number);
-    // Safety valve: drop the lock after 3 minutes regardless
-    const lockTimeout = setTimeout(() => locks.delete(number), 180000);
+    const lockTimeout = setTimeout(() => {
+        locks.delete(number);
+        pairing.delete(number);
+    }, 180000);
 
-    // ── fetch current auth state ──────────────────────────────────
+    // ── load auth state ───────────────────────────────────────────
     let { state, saveCreds, clear } = await useDiskAuthState(number);
 
-    // Already fully registered — no new code needed
     if (state.creds && state.creds.registered) {
         locks.delete(number);
         clearTimeout(lockTimeout);
         return { alreadyPaired: true };
     }
 
-    // Clear any stale/half-baked credentials before requesting a new code
-    // (Reference bot FIX: avoids "unavailable" pairing-code error)
-    console.log(`[🧹] Cleaning incomplete/stale pairing cache for ${number}...`);
+    // Clear any stale/incomplete pairing state before starting fresh
+    console.log(`[🧹] Clearing stale pairing state for ${number}...`);
     await clear().catch(() => {});
     ({ state, saveCreds, clear } = await useDiskAuthState(number));
 
-    // Always fetch the latest WA Web version (Reference bot + FAIZAN fix)
+    // Always use latest WA Web version
     let version;
     try {
         ({ version } = await fetchLatestBaileysVersion());
-        console.log(`[ℹ️] Using WA Web version ${version.join('.')}`);
+        console.log(`[ℹ️] WA Web version: ${version.join('.')}`);
     } catch (e) {
-        console.error('[⚠️] fetchLatestBaileysVersion failed, using library default:', e.message);
+        console.error('[⚠️] fetchLatestBaileysVersion failed:', e.message);
     }
 
     const pairLogger = pino({ level: 'silent' });
-
-    // ── create the pairing socket ─────────────────────────────────
-    // Browser: Browsers.ubuntu('Chrome') — matches the Reference bot exactly.
-    // fireInitQueries: false — lighter handshake; we only need the pairing IQ.
     const sock = makeWASocket({
         auth: {
             creds: state.creds,
@@ -161,85 +150,131 @@ async function generatePairCode(number) {
         fireInitQueries: false,
         markOnlineOnConnect: false,
         syncFullHistory: false,
-        browser: Browsers.ubuntu('Chrome'),   // ← Reference bot value (was macOS Desktop)
+        browser: Browsers.ubuntu('Chrome'),
         ...proxyOptions(),
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // ── TRANSPLANTED PAIRING LOGIC (from Reference Bot EmpirePair) ─
-    //  Wait 1500 ms for the socket WebSocket to fully open, then call
-    //  requestPairingCode() directly — no event listener needed.
-    //  3 retries with exponential back-off mirror the Reference bot's
-    //  config.MAX_RETRIES = 3 loop.
-    const MAX_RETRIES = 3;
-    try {
-        await delay(1500);  // let the WS handshake settle (Reference bot pattern)
+    // ════════════════════════════════════════════════════════════
+    //  BUG 1 FIX: Attach connection.update listener HERE, BEFORE
+    //  requestPairingCode is called.  The old code attached it
+    //  after requestPairingCode returned, creating a window where
+    //  connection === 'open' could fire and be missed entirely,
+    //  so startWorker was never called and the bot never started.
+    // ════════════════════════════════════════════════════════════
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
 
-        let code;
-        let retries = MAX_RETRIES;
-        while (retries > 0) {
-            try {
-                code = await sock.requestPairingCode(number);
-                break;
-            } catch (err) {
-                retries--;
-                console.warn(`[⚠️] requestPairingCode attempt failed for ${number} (${MAX_RETRIES - retries}/${MAX_RETRIES}):`, err.message);
-                if (retries === 0) throw err;
-                await delay(2000 * (MAX_RETRIES - retries));
+        if (connection === 'open') {
+            console.log(`[✅] ${number} paired — storing session...`);
+            try { await saveCreds(); } catch (_) {}
+            setTimeout(async () => {
+                try { await saveCreds(); } catch (_) {}
+                console.log(`[💾] ${number} session saved — launching bot worker`);
+                try { sock.ws.close(); } catch (_) {}
+                pairing.delete(number);
+                locks.delete(number);
+                clearTimeout(lockTimeout);
+                startWorker(number);
+            }, 5000);
+        }
+
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            locks.delete(number);
+            pairing.delete(number);
+            clearTimeout(lockTimeout);
+            try { sock.ws.close(); } catch (_) {}
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403) {
+                console.log(`[⚠️] Pairing socket closed (${statusCode}) for ${number} — clearing session`);
+                await clear().catch(() => {});
+            }
+        }
+    });
+
+    // ════════════════════════════════════════════════════════════
+    //  BUG 2 FIX: Use 'qr' event as primary trigger for
+    //  requestPairingCode.  When 'qr' fires, Baileys has completed
+    //  the noise handshake and WhatsApp is ready to auth — this is
+    //  the correct and reliable moment to call requestPairingCode.
+    //  Fallback: if qr doesn't fire within 3s (some Baileys versions
+    //  skip qr when printQRInTerminal=false), try directly anyway.
+    // ════════════════════════════════════════════════════════════
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            if (result.code) {
+                pairing.set(number, { code: result.code, at: Date.now() });
+                console.log(`[🔗] Pairing code for ${number}: ${result.code}`);
+            }
+            resolve(result);
+        };
+
+        let codeRequested = false;
+
+        async function doRequestCode() {
+            if (codeRequested) return;
+            codeRequested = true;
+            clearTimeout(fallbackTimer);
+
+            const MAX_RETRIES = 3;
+            let retries = MAX_RETRIES;
+            while (retries > 0) {
+                try {
+                    const code = await sock.requestPairingCode(number);
+                    const pretty = code?.match(/.{1,4}/g)?.join('-') || code;
+                    finish({ code: pretty });
+                    return;
+                } catch (err) {
+                    retries--;
+                    console.warn(`[⚠️] requestPairingCode attempt ${MAX_RETRIES - retries}/${MAX_RETRIES} for ${number}: ${err.message}`);
+                    if (retries === 0) {
+                        locks.delete(number);
+                        pairing.delete(number);
+                        clearTimeout(lockTimeout);
+                        try { sock.ws.close(); } catch (_) {}
+                        finish({ error: err.message || 'Failed to generate pairing code — try again' });
+                        return;
+                    }
+                    await delay(2000 * (MAX_RETRIES - retries));
+                }
             }
         }
 
-        const pretty = code?.match(/.{1,4}/g)?.join('-') || code;
-        pairing.set(number, { code: pretty, at: Date.now() });
-        console.log(`[🔗] Pairing code for ${number}: ${pretty}`);
-
-        // ── post-pairing lifecycle listener ──────────────────────
-        // Only handles 'open' (session ready → start worker) and
-        // 'close' (cleanup).  Code delivery already done above.
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect } = update;
-
-            if (connection === 'open') {
-                console.log(`[✅] ${number} paired successfully — finishing session sync...`);
-                await saveCreds();
-                setTimeout(async () => {
-                    try { await saveCreds(); } catch (_) {}
-                    console.log(`[💾] ${number} session stored — starting bot`);
-                    try { sock.ws.close(); } catch (_) {}
-                    pairing.delete(number);
-                    locks.delete(number);
-                    startWorker(number);
-                }, 5000);
-            }
-
-            if (connection === 'close') {
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                locks.delete(number);
-                pairing.delete(number);
-                try { sock.ws.close(); } catch (_) {}
-                if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403) {
-                    console.log(`[⚠️] Pairing socket closed (${statusCode}) for ${number} — clearing partial session`);
-                    await clear().catch(() => {});
-                }
+        // Primary: request code when qr fires (socket is confirmed ready)
+        sock.ev.on('connection.update', (update) => {
+            if (update.qr && !codeRequested) {
+                doRequestCode();
             }
         });
 
-        clearTimeout(lockTimeout);
-        return { code: pretty };
+        // Fallback: try after 3s if qr event never fires
+        const fallbackTimer = setTimeout(() => {
+            if (!codeRequested) {
+                console.log(`[⏱️] qr event not fired for ${number} — using fallback timer`);
+                doRequestCode();
+            }
+        }, 3000);
 
-    } catch (e) {
-        console.error(`[❌] requestPairingCode failed for ${number}:`, e.message);
-        locks.delete(number);
-        pairing.delete(number);
-        clearTimeout(lockTimeout);
-        try { sock.ws.close(); } catch (_) {}
-        return { error: e.message || 'Failed to request pairing code, try again' };
-    }
+        // Hard timeout: give up after 60s
+        setTimeout(() => {
+            if (!settled) {
+                clearTimeout(fallbackTimer);
+                locks.delete(number);
+                pairing.delete(number);
+                clearTimeout(lockTimeout);
+                try { sock.ws.close(); } catch (_) {}
+                finish({ error: 'Pairing timed out — please try again' });
+            }
+        }, 60000);
+    });
 }
 
 // ════════════════════════════════════════════════════════════════
-//  ROUTES  (UNCHANGED from original FAIZAN-MD-MINI index.js)
+//  ROUTES
 // ════════════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'pair.html'));
@@ -254,7 +289,6 @@ app.get('/pair', async (req, res) => {
         return res.status(429).json({ error: `Bot limit reached (${MAX_BOTS}). Remove a number first.` });
     }
     try {
-        // Validate if session is actually REGISTERED before blocking user
         const { state } = await useDiskAuthState(number);
         const isRegistered = state?.creds?.registered || false;
 
@@ -262,15 +296,14 @@ app.get('/pair', async (req, res) => {
             startWorker(number);
             return res.json({ status: 'already_paired', message: 'This number is already linked — bot is running.' });
         } else if (await hasSession(number)) {
-            // Unregistered/stale session found — delete it so a fresh code can generate
-            console.log(`[⚠️] Unregistered session found for ${number}. Resetting for new pairing...`);
+            console.log(`[⚠️] Stale session for ${number} — resetting...`);
             stopWorker(number);
             await deleteSession(number).catch(() => {});
         }
 
         const result = await generatePairCode(number);
         if (result.inProgress) {
-            return res.json({ status: 'pending', message: 'Pairing already in progress — wait for the code to appear.' });
+            return res.json({ status: 'pending', message: 'Pairing already in progress — wait for the code.' });
         }
         if (result.alreadyPaired) {
             startWorker(number);
@@ -311,7 +344,7 @@ app.get('/delete', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-//  BOOT — restore every saved session  (UNCHANGED)
+//  BOOT — restore saved sessions
 // ════════════════════════════════════════════════════════════════
 app.listen(PORT, async () => {
     console.log(`\n🚀 FAIZAN-MD MINI pairing server on port ${PORT}`);
@@ -322,15 +355,14 @@ app.listen(PORT, async () => {
         if (!numbers.length) {
             console.log('[ℹ️] No saved sessions yet — open the pairing page to link a number.');
         } else {
-            console.log(`[♻️] Restoring ${numbers.length} saved session(s): ${numbers.join(', ')}`);
+            console.log(`[♻️] Restoring ${numbers.length} session(s): ${numbers.join(', ')}`);
             numbers.slice(0, MAX_BOTS).forEach((n, i) => setTimeout(() => startWorker(n), i * 8000));
         }
         const broken = await listNeedsRepair().catch(() => []);
         if (broken.length) {
-            console.log(`[⚠️] Needs re-pairing (not auto-started): ${broken.join(', ')}`);
-            console.log('    Open the pairing page for these numbers to link them again.');
+            console.log(`[⚠️] Needs re-pairing: ${broken.join(', ')}`);
         }
-        if (PROXY_URL) console.log('[🌐] PROXY_URL is set — WhatsApp traffic will use the proxy.');
+        if (PROXY_URL) console.log('[🌐] PROXY_URL set — using proxy for WhatsApp traffic.');
     } catch (err) {
         console.error('[❌] MongoDB not reachable — check MONGODB_URI:', err.message);
     }
@@ -340,11 +372,10 @@ process.on('uncaughtException', (err) => {
     console.error('[⚠️] Uncaught exception in pairing server:', err.message);
 });
 process.on('unhandledRejection', (reason) => {
-    console.error('[⚠️] Unhandled rejection in pairing server:', reason?.message || reason);
+    console.error('[⚠️] Unhandled rejection:', reason?.message || reason);
 });
-
 process.on('SIGTERM', () => {
-    console.log('[🛑] Shutting down all bots...');
+    console.log('[🛑] Shutting down...');
     for (const n of [...workers.keys()]) stopWorker(n);
     process.exit(0);
 });
