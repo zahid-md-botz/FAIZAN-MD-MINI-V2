@@ -400,8 +400,13 @@ async function connectToWA() {
     // 401, and the 401 branch below would then wipe the very session the user is in
     // the middle of creating. Stop here and let the pairing page finish its job.
     if (!state.creds || !state.creds.registered) {
-        console.log(`[⚠️] ${BOT_NUMBER} is not paired yet — open the pairing page and enter the code. Not connecting.`);
+    console.log(`[⚠️] ${BOT_NUMBER} is not paired yet. Waiting for pairing to complete...`);
+    // Exit after 5 minutes if still not paired
+    setTimeout(() => {
+        console.log(`[⏰] ${BOT_NUMBER} pairing timeout. Exiting.`);
         process.exit(0);
+    }, 300000);
+    return; // Don't exit immediately, wait for pairing
     }
     
     // FIX: fetchLatestBaileysVersion was imported but never called — Baileys' bundled
