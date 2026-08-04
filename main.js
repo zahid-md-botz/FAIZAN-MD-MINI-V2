@@ -394,28 +394,24 @@ async function handleMessageUltra(message) {
 
 //=======SESSION-AUTH==============
 async function connectToWA() {
-    console.log("[🔰] FAIZAN-MD Connecting to WhatsApp ⏳️...");
+    console.log(`[🔰] FAIZAN-MD Connecting WhatsApp for (${BOT_NUMBER})...`);
     
-    // MongoDB session (mini style): survives restarts, no SESSION_ID needed
     const { state, saveCreds } = await useDiskAuthState(BOT_NUMBER);
 
-    // Guard: connecting with creds that never completed pairing earns an immediate
-    // 401, and the 401 branch below would then wipe the very session the user is in
-    // the middle of creating. Stop here and let the pairing page finish its job.
+    // FIX: Don't kill worker process abruptly; retry if credentials are still syncing
     if (!state.creds || !state.creds.registered) {
-        console.log(`[⚠️] ${BOT_NUMBER} is not paired yet — open the pairing page and enter the code. Not connecting.`);
-        process.exit(0);
+        console.log(`[⚠️] ${BOT_NUMBER} keys are not fully registered yet. Waiting 5s...`);
+        await new Promise(r => setTimeout(r, 5000));
+        const recheck = await useDiskAuthState(BOT_NUMBER);
+        if (!recheck.state.creds.registered) {
+            console.log(`[❌] Credentials failed for ${BOT_NUMBER}. Exiting worker.`);
+            process.exit(1);
+        }
     }
-    
-    
-    // lib/ and data/ helpers (msg.js, exif.js, antidel.js, groupevents.js,
-    // converter.js) reference a bare `conn`, which resolves to the global scope —
-    // without this it throws "conn is not defined" at runtime.
+
     let conn;
     const waLogger = P({ level: 'silent' });
     conn = makeWASocket({
-        // Same option set as the working ArslanMD mini bot: no explicit `version`,
-        // cacheable signal key store, and no 60s query timeout to abort the handshake.
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, waLogger),
@@ -429,17 +425,10 @@ async function connectToWA() {
         fireInitQueries: true,
         markOnlineOnConnect: true,
         generateHighQualityLinkPreview: true,
-        syncFullHistory: true,
-        browser: ['Mac OS', 'Safari', '10.15.7'],
-        ...proxyOptions(),   // no-op unless PROXY_URL is set
+        syncFullHistory: false,
+        browser: Browsers.macOS('Safari'),
+        ...proxyOptions(),
         getMessage: async (key) => {
-            // FIX: empty-message spam bug.
-            // Baileys calls getMessage() when a retry receipt asks for
-            // resend of an older message. Returning {conversation:''}
-            // here made Baileys actually SEND that blank text to satisfy
-            // the retry -> repeated empty bubbles in bursts after
-            // reconnects. Returning undefined tells Baileys to skip the
-            // resend instead of transmitting a blank message.
             if (messageStore.has(key.id)) {
                 return messageStore.get(key.id).message;
             }
@@ -447,8 +436,9 @@ async function connectToWA() {
         }
     });
 
-    // Publish the live socket and replay the listeners the helpers registered at boot.
     connBridge.attach(conn);
+    // ... باقی main.js کا کوڈ ویسے ہی رہنے دو
+
 
     conn.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
