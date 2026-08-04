@@ -1,15 +1,6 @@
 /**
  * FAIZAN-MD MINI — pairing server + multi-number worker manager.
- *
- * What this file does (the "mini" part):
- *   1. Serves the pairing page (pair.html) — user enters their number, gets an 8-digit
- *      WhatsApp pairing code. No SESSION_ID, no QR scanning.
- *   2. Stores every login in MongoDB (lib/sessionStore.js), so sessions survive restarts.
- *   3. Runs ONE child process per paired number (main.js = the full FAIZAN-MD bot).
- *      Process isolation is deliberate: all 162 plugins keep their own in-memory state
- *      (antilink Maps, antidelete cache, warn counters), so numbers never mix data.
- *
- * The bot logic itself lives in main.js and is unchanged from FAIZAN-MD.
+ * FIXED: Endless loading & false "already linked" issue for failed pairing attempts.
  */
 
 const express = require('express');
@@ -27,14 +18,11 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const config = require('./config');
-// Auth state now lives on local disk (instant key reads) with MongoDB as the backup —
-// the custom Mongo-only store timed the pairing handshake out.
 const { useDiskAuthState, hasSession, listNumbers, listNeedsRepair, deleteSession, getMongo } = require('./lib/sessionStore');
 const { proxyOptions, PROXY_URL } = require('./lib/proxyAgent');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
-// Each bot process needs ~200MB. Keep this low on free hosting (512MB = 1-2 numbers).
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || '3', 10);
 
 app.use(bodyParser.json());
@@ -65,7 +53,6 @@ function startWorker(number) {
     proc.on('exit', (code) => {
         console.log(`[⏹️] Bot ${number} exited (code ${code})`);
         workers.delete(number);
-        // code 0 = session cleared / logged out on purpose -> do not restart
         if (code === 0) return;
         const restarts = entry.restarts + 1;
         if (restarts > 5) {
@@ -95,9 +82,7 @@ function stopWorker(number) {
 // ════════════════════════════════════════════════════════════════
 //  PAIRING — generate an 8-digit code for a number
 // ════════════════════════════════════════════════════════════════
-const pairing = new Map();  // number -> { code, at }
-// One pairing socket per number. Two live sockets for the same number make WhatsApp
-// reject the login with 401, which is easy to trigger by double-tapping the button.
+const pairing = new Map();  
 const locks = new Set();
 
 async function generatePairCode(number) {
@@ -107,22 +92,21 @@ async function generatePairCode(number) {
         return { inProgress: true };
     }
     locks.add(number);
-    setTimeout(() => locks.delete(number), 180000);   // never wedge the number shut
+    setTimeout(() => locks.delete(number), 180000);
 
     let { state, saveCreds, clear } = await useDiskAuthState(number);
 
-    if (state.creds.registered) {
+    // FIX 1: Jeśli numer jest w pełni zarejestrowany w WhatsApp
+    if (state.creds && state.creds.registered) {
+        locks.delete(number);
         return { alreadyPaired: true };
     }
 
-    // Leftover keys from an abandoned/failed attempt make WhatsApp reject the new
-    // pairing immediately, so drop them and re-init before asking for a code.
+    // FIX 2: Clear any stale/half-baked credentials before requesting new code
+    console.log(`[🧹] Cleaning incomplete/stale pairing cache for ${number}...`);
     await clear().catch(() => {});
     ({ state, saveCreds, clear } = await useDiskAuthState(number));
 
-    // Socket options fixed for stable pairing handshake:
-    //   - Ubuntu/Firefox browser fingerprint (prevents WhatsApp 401/405 blocks)
-    //   - Cacheable signal key store for fast MongoDB syncs
     const pairLogger = pino({ level: 'silent' });
     const sock = makeWASocket({
         auth: {
@@ -131,15 +115,15 @@ async function generatePairCode(number) {
         },
         printQRInTerminal: false,
         logger: pairLogger,
-        connectTimeoutMs: 120000,
+        connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 0,
         keepAliveIntervalMs: 10000,
         emitOwnEvents: false,
-        fireInitQueries: true,
-        markOnlineOnConnect: true,
-        syncFullHistory: false,
-        browser: Browsers.ubuntu('Firefox'), // FIX: Prevents pairing code rejection
-        ...proxyOptions(),   // no-op unless PROXY_URL is set
+        fireInitQueries: false,
+        markOnlineOnConnect: false,
+        syncFullHistory: false, // FIX 3: Prevents endless loading screen on phone
+        browser: Browsers.macOS('Desktop'), // FIX 4: Stable macOS desktop agent prevents rejection
+        ...proxyOptions(),
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -149,9 +133,6 @@ async function generatePairCode(number) {
         if (connection === 'open') {
             console.log(`[✅] ${number} paired successfully — finishing session sync...`);
             await saveCreds();
-            // Closing 2s after 'open' cut the post-registration key sync short, so the
-            // worker's fresh connect was rejected with 401. Give WhatsApp time to finish
-            // writing keys, then hand over.
             setTimeout(async () => {
                 try { await saveCreds(); } catch (e) {}
                 console.log(`[💾] ${number} session stored — starting bot`);
@@ -159,20 +140,19 @@ async function generatePairCode(number) {
                 pairing.delete(number);
                 locks.delete(number);
                 startWorker(number);
-            }, 15000);
+            }, 5000);
         }
         if (connection === 'close') {
             const code = lastDisconnect?.error?.output?.statusCode;
             locks.delete(number);
-            if (code === DisconnectReason.loggedOut || code === 401) {
+            if (code === DisconnectReason.loggedOut || code === 401 || code === 403) {
                 console.log(`[⚠️] Pairing failed for ${number} (${code}) — clearing partial session`);
                 await clear().catch(() => {});
             }
         }
     });
 
-    // WhatsApp needs a moment before it will issue a pairing code
-    await new Promise(r => setTimeout(r, 3000));
+    await new Promise(r => setTimeout(r, 2000));
     const code = await sock.requestPairingCode(number);
     const pretty = code?.match(/.{1,4}/g)?.join('-') || code;
     pairing.set(number, { code: pretty, at: Date.now() });
@@ -196,10 +176,20 @@ app.get('/pair', async (req, res) => {
         return res.status(429).json({ error: `Bot limit reached (${MAX_BOTS}). Remove a number first.` });
     }
     try {
-        if (await hasSession(number)) {
+        // FIX 5: Validate if session is actually REGISTERED before blocking user
+        const { state } = await useDiskAuthState(number);
+        const isRegistered = state?.creds?.registered || false;
+
+        if (isRegistered) {
             startWorker(number);
             return res.json({ status: 'already_paired', message: 'This number is already linked — bot is running.' });
+        } else if (await hasSession(number)) {
+            // Unregistered/stale session found on disk/mongo — delete it so fresh code can generate
+            console.log(`[⚠️] Unregistered session found for ${number}. Resetting for new pairing...`);
+            stopWorker(number);
+            await deleteSession(number).catch(() => {});
         }
+
         const result = await generatePairCode(number);
         if (result.inProgress) {
             return res.json({ status: 'pending', message: 'Pairing already in progress — wait for the code to appear.' });
@@ -254,7 +244,6 @@ app.listen(PORT, async () => {
             console.log(`[♻️] Restoring ${numbers.length} saved session(s): ${numbers.join(', ')}`);
             numbers.slice(0, MAX_BOTS).forEach((n, i) => setTimeout(() => startWorker(n), i * 8000));
         }
-        // Rejected numbers are reported, never auto-started — that loop wiped sessions.
         const broken = await listNeedsRepair().catch(() => []);
         if (broken.length) {
             console.log(`[⚠️] Needs re-pairing (not auto-started): ${broken.join(', ')}`);
@@ -266,8 +255,6 @@ app.listen(PORT, async () => {
     }
 });
 
-// A crash in this process kills the live pairing socket, and the user's freshly
-// entered code then has nothing listening for it. Log and keep serving instead.
 process.on('uncaughtException', (err) => {
     console.error('[⚠️] Uncaught exception in pairing server:', err.message);
 });
